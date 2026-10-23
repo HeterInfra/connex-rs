@@ -9,7 +9,7 @@ repository = "https://github.com/HeterInfra/connex-rs"
 keywords = ["ucx", "rdma", "gpudirect", "llm-serving", "transport"]
 categories = ["network-programming", "api-bindings"]
 links = "ucp"
-exclude = ["/results", "/target*", "/dist", "/.github", "/scripts"]
+exclude = ["/results", "/target*", "/dist", "/.github", "/scripts", "/docs/assets/social"]
 
 [lib]
 name = "connex_rs"
