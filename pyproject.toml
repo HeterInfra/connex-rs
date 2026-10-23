@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "connex-rs"
+version = "0.1.0"
+description = "connex-rs: Connex data plane over UCX (one-sided RMA, signals, peer-failure events, same-identity rejoin)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+keywords = ["ucx", "rdma", "gpudirect", "llm serving", "connex"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Repository = "https://github.com/HeterInfra/connex-rs"
+Connex = "https://github.com/HeterInfra/connex"
+
+[tool.maturin]
+features = ["python"]
+module-name = "connex_rs"
+# UCX is a system library (HPC-X /opt/hpcx/ucx, rpath); bundling it would
+# cut libucs off from its transport modules.
+auditwheel = "skip"

@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Runners have no RDMA or GPU: build against the distro UCX, test over TCP on loopback.
+  UCX_HOME: /usr
+  UCX_TLS: tcp
+
+jobs:
+  release-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Scan for environment-specific data and secrets
+        run: python scripts/check_release.py
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: UCX and Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libucx-dev ucx-utils python3-dev
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --release --all-targets --all-features -- -D warnings
+      - name: cargo test
+        run: cargo test --release
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: UCX and Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libucx-dev ucx-utils
+          rustup toolchain install stable --profile minimal
+      - name: maturin build
+        run: |
+          python -m pip install --upgrade pip "maturin>=1.5,<2"
+          maturin build --release -o dist
+          pip install dist/connex_rs-*.whl
+      - name: Binding smoke test
+        run: python -c "import connex_rs; e = connex_rs.Engine('ci', 0, listen_ip='127.0.0.1'); print(e.local_url); e.close()"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connex-rs-wheel
+          path: dist/*.whl
