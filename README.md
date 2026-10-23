@@ -96,8 +96,9 @@ GPU memory (GPUDirect RDMA):
 
 Where connex-rs is not better: closed-loop throughput is 3% lower (not yet
 profiled), its TCP path (no RDMA) is several times slower than Mooncake's, which
-is why `auto` keeps Mooncake on hosts without RDMA, and the worst single
-request in the 4-in-flight runs waited 1.03 s.
+is why `auto` keeps Mooncake on hosts without RDMA, and individual requests
+can still stall for up to about 1 s (worst request 1.03 s at 1 step in
+flight, 0.92 s at 4) even though the per-run medians are far lower.
 
 ## Layout
 
