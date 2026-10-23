@@ -12,7 +12,7 @@
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <img alt="Rust 2021" src="https://img.shields.io/badge/rust-2021-orange?logo=rust">
   <img alt="UCX" src="https://img.shields.io/badge/transport-UCX%20%7C%20RDMA%20%7C%20GPUDirect-0d9488">
-  <img alt="Python >= 3.8 (abi3)" src="https://img.shields.io/badge/python-%E2%89%A53.8%20(abi3)-3776ab?logo=python&logoColor=white">
+  <img alt="Python >= 3.8 (abi3)" src="https://img.shields.io/badge/python-%E2%89%A53.8%20%28abi3%29-3776ab?logo=python&logoColor=white">
   <a href="https://pypi.org/project/connex-rs/"><img alt="PyPI" src="https://img.shields.io/badge/pypi-connex--rs-3775a9?logo=pypi&logoColor=white"></a>
   <a href="https://crates.io/crates/connex-rs"><img alt="crates.io" src="https://img.shields.io/badge/crates.io-connex--rs-e6b14c?logo=rust"></a>
   <a href="https://github.com/HeterInfra/connex"><img alt="Connex, SIGCOMM 2026" src="https://img.shields.io/badge/Connex-SIGCOMM%202026-8a2be2"></a>
@@ -70,7 +70,7 @@ GPU memory (GPUDirect RDMA):
 
 | size | connex-rs | Mooncake TE |
 |---|---|---|
-| 16 KB | 7.9-9.6 µs | 9 µs |
+| 16 KB | 8-10 µs | 9 µs |
 | 1 MB | 98-106 µs | 116 µs |
 | 16 MB | 1.69 ms | 2 ms |
 
@@ -90,12 +90,12 @@ GPU memory (GPUDirect RDMA):
 | peer death detected | in a few ms (UCX endpoint error) | not reported; lease + timeout + probe |
 | handover, kill stage to next token (median per run) | 0.02-0.03 s at 1 step in flight, 0.01-0.83 s at 4 | 2-3 s |
 | restart one killed stage under the same identity | works; the other stages keep running | breaks its peers; restart the whole chain |
-| hard churn, QPS 8, without / with the resume proxy | 99.17% / 100% goodput | ~99.2% / 100% |
+| hard churn, QPS 8, without / with the resume proxy | 99.2% / 100% goodput | 99.2% / 100% |
 | correctness after failover (18 kill runs) | all requests complete, 0 tokens off the argmax | same |
 | 100 kill / rejoin cycles | fds, RSS, registered memory flat | not applicable |
 
 Where connex-rs is not better: closed-loop throughput is 3% lower (not yet
-profiled), its TCP path (no RDMA) is about 10x slower than Mooncake's, which
+profiled), its TCP path (no RDMA) is several times slower than Mooncake's, which
 is why `auto` keeps Mooncake on hosts without RDMA, and the worst single
 request in the 4-in-flight runs waited 1.03 s.
 
