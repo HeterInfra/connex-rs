@@ -5,3 +5,7 @@ results/**/*.victim.log
 /results
 __pycache__/
 *.so
+
+*.egg-info/
+.pytest_cache/
+.venv/
