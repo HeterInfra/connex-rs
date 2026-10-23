@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 // Builds csrc/cxshim.c against the system UCX.
 // UCX prefix: $UCX_HOME, else /opt/hpcx/ucx (HPC-X, also used by ucx-py on
 // these machines), else /usr.

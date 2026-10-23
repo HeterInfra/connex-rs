@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 //! connex-rs: a Connex-native transport prototype over UCX.
 //!
 //! An [`Endpoint`] is owned by one process and named by a [`LogicalId`]

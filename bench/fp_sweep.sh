@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Heartbeat timeout sweep for false positives: receiver CPU-saturated and
 # 64 MB steps (the receiver's single thread verifies each step for
 # hundreds of ms without calling progress). Results: results/local/fpsweep_*.jsonl

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 //! Python binding (feature "python", built with maturin).
 //!
 //! `connex_rs.Engine` is the data plane used by connex.pp (TransferEngine

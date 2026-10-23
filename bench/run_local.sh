@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Two processes on this host: survivor + a victim that a loop restarts after
 # every fault (same logical id each time).
 #

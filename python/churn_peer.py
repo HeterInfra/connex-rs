@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 """Kill/rejoin churn against a live connex-rs engine (leak check, G6).
 
 Each cycle starts a child process that brings up a connex_rs.Engine under

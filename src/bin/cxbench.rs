@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 //! cxbench: failure-detection, rejoin and steady-state benchmarks for connex-rs.
 //!
 //! Two roles, each a process:

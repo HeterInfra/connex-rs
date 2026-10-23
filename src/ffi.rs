@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 //! Raw bindings to csrc/cxshim.c (which wraps UCP). Only opaque pointers and
 //! plain integers cross this boundary, so no UCX struct layout is mirrored.
 use libc::{c_char, c_int, c_uint, c_void, size_t};

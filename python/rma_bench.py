@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 """One-sided read benchmark and GPU check for connex_rs.Engine.
 
 Reader and owner are separate processes (cross-host: run `owner` on one

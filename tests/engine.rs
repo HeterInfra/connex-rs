@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 //! Engine tests: real UCX on loopback ($CONNEX_RS_TEST_TLS, default tcp).
 use connex_rs::engine::{Engine, EngineConfig, Target};
 use connex_rs::{Error, Event, LogicalId};

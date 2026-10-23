@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 //! Threaded data-plane engine on top of [`Endpoint`].
 //!
 //! One dedicated progress thread owns the UCX worker (single-threaded mode);

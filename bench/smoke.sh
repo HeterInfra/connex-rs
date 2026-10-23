@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Quick 5-cycle kill/rejoin smoke test over each local transport.
 cd "$(dirname "$0")/.." || exit 1
 mkdir -p results

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 """Summarise cxbench JSONL results into markdown tables.
 
 usage: python3 bench/summarize.py results/local results/xhost

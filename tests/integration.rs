@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Connex project
 //! Integration tests: real UCX endpoints in threads / processes on this host.
 //! Transport: $CONNEX_RS_TEST_TLS (default "tcp"; e.g. "rc_mlx5" with
 //! CONNEX_RS_TEST_IP set to the IPoIB address).

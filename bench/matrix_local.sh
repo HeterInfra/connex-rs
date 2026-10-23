@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Full single-host matrix. Results: results/local/<name>.jsonl
 # usage: bench/matrix_local.sh [phase...]   phases: kill idle burn big stop fp lat (default: all)
 # Pinned to a few cores (CPUS_SURV / CPUS_VICT) so a shared host is not disturbed.

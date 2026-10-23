@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 """Smoke test of the connex_rs Python module: two processes, SIGKILL one,
 restart it under the same logical id, transfers resume.
 
