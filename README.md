@@ -12,7 +12,7 @@
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <img alt="Rust 2021" src="https://img.shields.io/badge/rust-2021-orange?logo=rust">
   <img alt="UCX" src="https://img.shields.io/badge/transport-UCX%20%7C%20RDMA%20%7C%20GPUDirect-0d9488">
-  <img alt="Python >= 3.8 (abi3)" src="https://img.shields.io/badge/python-%E2%89%A53.8%20%28abi3%29-3776ab?logo=python&logoColor=white">
+  <img alt="Python 3.8+ (abi3)" src="https://img.shields.io/badge/python-%E2%89%A53.8%20%28abi3%29-3776ab?logo=python&logoColor=white">
   <a href="https://pypi.org/project/connex-rs/"><img alt="PyPI" src="https://img.shields.io/badge/pypi-connex--rs-3775a9?logo=pypi&logoColor=white"></a>
   <a href="https://crates.io/crates/connex-rs"><img alt="crates.io" src="https://img.shields.io/badge/crates.io-connex--rs-e6b14c?logo=rust"></a>
   <a href="https://github.com/HeterInfra/connex"><img alt="Connex, SIGCOMM 2026" src="https://img.shields.io/badge/Connex-SIGCOMM%202026-8a2be2"></a>
