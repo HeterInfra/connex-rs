@@ -1,6 +1,6 @@
 [package]
 name = "connex-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Connex data plane over UCX: one-sided RMA on host/GPU memory, identity-keyed peers, peer-failure events, same-identity rejoin"
 license = "Apache-2.0"

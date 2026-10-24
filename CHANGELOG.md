@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Python: `Engine.put_async`, a posted one-sided write that returns a handle
+  to wait on later (used by the Connex SGLang PD transfer backend for
+  non-blocking KV writes).
+
 ## 0.1.0
 
 First release of connex-rs as its own repository (previously
