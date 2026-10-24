@@ -488,6 +488,32 @@ impl PyEngine {
         Ok(PyTransfer { c })
     }
 
+    /// Starts a one-sided write of local `src_ptr` to `dst_ptr` in the peer;
+    /// returns a Transfer handle (completes once the data is in place).
+    #[pyo3(signature = (remote_url, src_ptr, dst_ptr, length, timeout_ms=None))]
+    fn put_async(
+        &self,
+        remote_url: &str,
+        src_ptr: u64,
+        dst_ptr: u64,
+        length: u64,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<PyTransfer> {
+        let c = self
+            .e
+            .rma_async(
+                remote_url,
+                true,
+                src_ptr,
+                dst_ptr,
+                length,
+                ms(timeout_ms),
+                None,
+            )
+            .map_err(to_py)?;
+        Ok(PyTransfer { c })
+    }
+
     /// One-sided write followed (after remote completion) by a signal
     /// message carrying `msg`; the peer receives it with recv_msg().
     #[pyo3(signature = (remote_url, src_ptr, dst_ptr, length, msg, timeout_ms=None))]
