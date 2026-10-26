@@ -414,7 +414,11 @@ void *cx_hello(void *ep, const void *buf, size_t len) {
     return ucp_am_send_nbx((ucp_ep_h)ep, CX_AM_HELLO, NULL, 0, buf, len, &p);
 }
 
-static const char hb_bytes[2] = {'P', 'R'};
+// Writable on purpose: UCX may send even a 1-byte payload zero-copy (the
+// threshold drops to a few bytes when its registration cache is off, e.g. in
+// processes that import OpenCV), and registering a read-only page with the
+// NIC fails, crashing the sender during wire-up. Never written.
+static char hb_bytes[2] = {'P', 'R'};
 
 // Heartbeat ping (pong=0) or pong (pong=1). The payload is static.
 void *cx_hb(void *ep, int pong) {

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fix a sender crash during wire-up across hosts: the 1-byte heartbeat
+  payload lived in read-only memory, and when UCX sent it zero-copy (low
+  zero-copy threshold without a registration cache) registering it with the
+  NIC failed. The buffer is now writable.
+
 ## 0.1.1
 
 - Python: `Engine.put_async`, a posted one-sided write that returns a handle
