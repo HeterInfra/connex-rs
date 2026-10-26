@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
 - Fix a sender crash during wire-up across hosts: the 1-byte heartbeat
   payload lived in read-only memory, and when UCX sent it zero-copy (low
