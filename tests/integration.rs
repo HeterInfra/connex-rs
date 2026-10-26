@@ -151,10 +151,18 @@ fn client_reconnect_to_replaced_server() {
 
 /// A peer that stops progressing (hung) is reported by the heartbeat, and a
 /// healthy idle peer is not.
+///
+/// The healthy window starts once the link is up (the peer's hello reached
+/// us), not when `connect` returns: wire-up is asynchronous and can take
+/// over a second on a loaded machine (CI runners). Before a peer has been
+/// heard from, the timeout is the connect grace (5 s), so a peer that hung
+/// during wire-up is not reported by the heartbeat within the test window;
+/// it only shows up as a reset when it finally exits.
 #[test]
 fn heartbeat_detects_hung_peer_only() {
     let ip = setup();
     let (tx, rx) = mpsc::channel::<u16>();
+    let (up_tx, up_rx) = mpsc::channel::<()>();
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let ip2 = ip.clone();
     let hb = Heartbeat {
@@ -166,6 +174,12 @@ fn heartbeat_detects_hung_peer_only() {
         ep.set_heartbeat(Some(hb));
         let port = rx.recv().unwrap();
         ep.connect(&id(0, 0), &ip2, port).unwrap();
+        // wire-up: progress until the server has bound us
+        let t = Instant::now();
+        while up_rx.try_recv().is_err() {
+            assert!(t.elapsed() < Duration::from_secs(20), "link never came up");
+            ep.progress();
+        }
         // healthy for 1 s
         let t = Instant::now();
         while t.elapsed() < Duration::from_secs(1) {
@@ -178,21 +192,29 @@ fn heartbeat_detects_hung_peer_only() {
     let mut ep = Endpoint::new(id(0, 0)).unwrap();
     ep.set_heartbeat(Some(hb));
     tx.send(ep.listen(&ip, 0).unwrap()).unwrap();
+    let mut up = false;
     let mut hang_at = None;
     let mut failed = None;
     let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(5) && failed.is_none() {
+    while t.elapsed() < Duration::from_secs(25) && failed.is_none() {
         if hang_at.is_none() && go_rx.try_recv().is_ok() {
             hang_at = Some(Instant::now());
         }
-        if let Some(Event::PeerFailed { reason, .. }) = ep.poll_event() {
-            failed = Some((Instant::now(), reason));
+        match ep.poll_event() {
+            Some(Event::PeerJoined { peer, .. }) if !up && peer == id(1, 3) => {
+                up = true;
+                up_tx.send(()).unwrap();
+            }
+            Some(Event::PeerFailed { reason, .. }) => failed = Some((Instant::now(), reason)),
+            _ => {}
         }
     }
     let (when, reason) = failed.expect("hung peer not detected");
-    let hang_at = hang_at.expect("failure reported before the peer hung (false positive)");
-    assert_eq!(reason, "heartbeat timeout");
+    let hang_at = hang_at.unwrap_or_else(|| {
+        panic!("failure reported before the peer hung (false positive): {reason}")
+    });
     let dt = when - hang_at;
+    assert_eq!(reason, "heartbeat timeout", "after {dt:?}");
     assert!(dt < Duration::from_millis(600), "detection took {dt:?}");
     peer.join().unwrap();
 }
