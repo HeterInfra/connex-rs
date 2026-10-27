@@ -323,6 +323,22 @@ int cx_poll_event(cx_ctx_t *c, cx_event_t *out) {
     return 1;
 }
 
+// Drops the queued events of an endpoint being closed. Endpoints are
+// identified by address and UCX reuses the address of a freed endpoint for
+// the next one it creates (an accepted reconnect, typically): an error or
+// message of the old endpoint still queued would be taken for the new one.
+void cx_forget_ep(cx_ctx_t *c, void *ep) {
+    for (uint64_t i = c->head; i != c->tail; i++) {
+        cx_event_t *e = &c->ring[i % CX_EVQ];
+        if (e->ep == ep) {
+            free(e->payload);
+            e->payload = NULL;
+            e->plen = 0;
+            e->type = 0;
+        }
+    }
+}
+
 uint64_t cx_dropped_events(cx_ctx_t *c) { return c->dropped; }
 
 const char *cx_status_string(int st) { return ucs_status_string((ucs_status_t)st); }

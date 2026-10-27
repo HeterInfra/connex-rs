@@ -648,6 +648,11 @@ struct State {
     orphans: Vec<Req>,
     /// Our connects waiting for their first flush (-> PeerUp).
     pending_up: Vec<(LogicalId, Req)>,
+    /// PeerJoined events still to come from our own connects (Endpoint
+    /// emits one per connect); any other join is the peer's hello.
+    own_joins: HashMap<LogicalId, u32>,
+    /// Peers whose current link was reported up (PeerUp once per link).
+    up: HashSet<LogicalId>,
     cuda_ctx: usize,
     stats: EngineStats,
 }
@@ -706,6 +711,8 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         unreg: Vec::new(),
         orphans: Vec::new(),
         pending_up: Vec::new(),
+        own_joins: HashMap::new(),
+        up: HashSet::new(),
         cuda_ctx,
         stats: EngineStats::default(),
     };
@@ -931,6 +938,7 @@ impl State {
             Cmd::Connect { url, done } => done.set(self.ensure_connected(&url)),
             Cmd::Disconnect { peer, done } => {
                 self.ep.drop_peer(&peer);
+                self.up.remove(&peer);
                 self.peer_gone(&peer, Error::PeerFailed(peer.clone()));
                 done.set(Ok(()));
             }
@@ -969,6 +977,7 @@ impl State {
         rp.requested.clear();
         rp.addr = Some(addr);
         self.ep.connect(&url.id, &url.ip, url.port)?;
+        *self.own_joins.entry(url.id.clone()).or_default() += 1;
         // The link is up once a flush completes (wireup done, peer reached).
         match self.ep.flush(&url.id) {
             Ok(req) => self.pending_up.push((url.id.clone(), req)),
@@ -1067,10 +1076,7 @@ impl State {
             });
             for p in up {
                 if self.ep.is_connected(&p) {
-                    self.publish(Event::PeerUp {
-                        peer: p,
-                        ts_ns: crate::now_ns(),
-                    });
+                    self.publish_up(p, crate::now_ns());
                 }
             }
         }
@@ -1231,6 +1237,14 @@ impl State {
         }
     }
 
+    /// PeerUp, once per link (a crossed connect reports it from whichever
+    /// of the inbound hello and our connect's flush comes first).
+    fn publish_up(&mut self, peer: LogicalId, ts_ns: u64) {
+        if self.up.insert(peer.clone()) {
+            self.publish(Event::PeerUp { peer, ts_ns });
+        }
+    }
+
     fn publish(&self, ev: Event) {
         self.sh.events.lock().unwrap().push_back(ev);
         self.sh.events_cv.notify_all();
@@ -1246,6 +1260,7 @@ impl State {
                 } => self.on_am(peer, h, data),
                 Event::PeerFailed { ref peer, .. } => {
                     if let Some(p) = peer {
+                        self.up.remove(p);
                         self.peer_gone(p, Error::PeerFailed(p.clone()));
                     }
                     self.publish(ev);
@@ -1256,14 +1271,28 @@ impl State {
                     rejoin,
                     ts_ns,
                 } => {
-                    // Inbound (the peer's hello arrived): the link works. Our
-                    // own connects report PeerUp after their flush instead.
-                    let ours = self.pending_up.iter().any(|(p, _)| p == peer);
+                    let ours = match self.own_joins.get_mut(peer) {
+                        Some(n) if *n > 0 => {
+                            *n -= 1;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if rejoin {
+                        self.up.remove(peer);
+                    } else if !ours {
+                        // The peer's hello, possibly replacing our own
+                        // connect (crossed connects): rkeys were unpacked on
+                        // the old endpoint; fetch them again on this one.
+                        // Ops already posted keep theirs and complete.
+                        if let Some(rp) = self.remote.get_mut(peer) {
+                            rp.regions.clear();
+                        }
+                    }
+                    // Inbound: the link works. Our own connects report
+                    // PeerUp after their flush instead.
                     if !ours {
-                        self.publish(Event::PeerUp {
-                            peer: peer.clone(),
-                            ts_ns,
-                        });
+                        self.publish_up(peer.clone(), ts_ns);
                     }
                     if rejoin {
                         // A new incarnation replaced the old endpoint: its

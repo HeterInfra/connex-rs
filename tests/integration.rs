@@ -223,18 +223,20 @@ fn heartbeat_detects_hung_peer_only() {
 /// SIGKILL faults, same-identity rejoin, payload checksums.
 #[test]
 fn sigkill_detect_and_rejoin_processes() {
+    use std::io::BufRead;
     let ip = setup();
     let bin = env!("CARGO_BIN_EXE_cxbench");
-    let port = 30000 + (std::process::id() % 10000) as u16;
-    let surv = Command::new(bin)
+    // Port 0 for both listeners: a fixed port can be taken (as an ephemeral
+    // source port of another connection, e.g. by tests running in parallel).
+    let mut surv = Command::new(bin)
         .args([
             "survivor",
             "--listen",
             &ip,
             "--port",
-            &port.to_string(),
+            "0",
             "--ctl-port",
-            &(port + 1).to_string(),
+            "0",
         ])
         .args([
             "--reps",
@@ -249,9 +251,21 @@ fn sigkill_detect_and_rejoin_processes() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    let mut stdout = std::io::BufReader::new(surv.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let field = |k: &str| -> u16 {
+        let i = ready
+            .find(&format!("\"{k}\":"))
+            .unwrap_or_else(|| panic!("ready: {ready}"));
+        let v = &ready[i + k.len() + 3..];
+        v[..v.find(|c: char| !c.is_ascii_digit()).unwrap()]
+            .parse()
+            .unwrap()
+    };
+    let (port, ctl_port) = (field("port"), field("ctl_port"));
     let connect = format!("{ip}:{port}");
-    let ctl = format!("{ip}:{}", port + 1);
+    let ctl = format!("{ip}:{ctl_port}");
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
     let looper = thread::spawn(move || {
@@ -279,10 +293,11 @@ fn sigkill_detect_and_rejoin_processes() {
             }
         }
     });
-    let out = surv.wait_with_output().unwrap();
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut text).unwrap();
+    surv.wait().unwrap();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     looper.join().unwrap();
-    let text = String::from_utf8_lossy(&out.stdout);
     let cycles: Vec<&str> = text
         .lines()
         .filter(|l| l.contains("\"type\":\"cycle\""))

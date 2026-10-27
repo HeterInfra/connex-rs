@@ -213,6 +213,7 @@ impl PyEndpoint {
         d.set_item("failures", s.failures)?;
         d.set_item("rejoins", s.rejoins)?;
         d.set_item("heartbeat_failures", s.heartbeat_failures)?;
+        d.set_item("crossed_connects", s.crossed_connects)?;
         d.set_item("dropped_events", s.dropped_events)?;
         Ok(d)
     }
@@ -590,6 +591,7 @@ impl PyEngine {
         d.set_item("failures", s.ep.failures)?;
         d.set_item("rejoins", s.ep.rejoins)?;
         d.set_item("heartbeat_failures", s.ep.heartbeat_failures)?;
+        d.set_item("crossed_connects", s.ep.crossed_connects)?;
         d.set_item("dropped_events", s.ep.dropped_events)?;
         d.set_item("regions", s.regions)?;
         d.set_item("region_bytes", s.region_bytes)?;

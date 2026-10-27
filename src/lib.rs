@@ -195,6 +195,11 @@ struct Peer {
     /// take hundreds of ms.
     heard: bool,
     last_ping: u64,
+    /// We opened this endpoint (connect), as opposed to accepting it.
+    outbound: bool,
+    /// Something (heartbeat, message) arrived on this endpoint: the peer
+    /// uses it, so an inbound hello can no longer be a crossed connect.
+    confirmed: bool,
 }
 
 /// Optional application-level heartbeat. UCX's own error handling reports
@@ -220,6 +225,8 @@ pub struct Stats {
     pub rejoins: u64,
     pub dropped_events: u64,
     pub heartbeat_failures: u64,
+    /// Simultaneous connects resolved by the tie-break (either side).
+    pub crossed_connects: u64,
 }
 
 /// A pending send or receive that owns its buffer.
@@ -234,6 +241,21 @@ pub struct Op {
     buf: Option<Vec<u8>>,
     len: usize,
     done: Option<Result<usize>>,
+}
+
+/// An op dropped while UCX still owns its buffer (not waited for, not
+/// canceled) must not free that buffer: a posted receive would later be
+/// matched by a message with its tag and UCX would write into freed memory.
+/// The buffer and the request are leaked instead; use [`Endpoint::wait`]
+/// (with a timeout, which cancels) to give an op up.
+impl Drop for Op {
+    fn drop(&mut self) {
+        if !self.req.is_null() {
+            if let Some(b) = self.buf.take() {
+                std::mem::forget(b);
+            }
+        }
+    }
 }
 
 impl Op {
@@ -254,6 +276,11 @@ pub struct Endpoint {
     peers: HashMap<LogicalId, Peer>,
     owner: HashMap<usize, LogicalId>,
     anon: HashSet<usize>,
+    /// Parked endpoints of a crossed connect that lost the tie-break: the
+    /// peer's connect to us while ours to it is the link. Messages arriving
+    /// on them are still delivered (sent before the peer switched); they are
+    /// never sent on, and the peer closes them. Promoted if the link fails.
+    aliases: HashMap<usize, LogicalId>,
     closing: Vec<*mut c_void>,
     hellos: Vec<*mut c_void>,
     /// generation per id survives failures so a rejoin is recognised.
@@ -338,6 +365,7 @@ impl Endpoint {
             peers: HashMap::new(),
             owner: HashMap::new(),
             anon: HashSet::new(),
+            aliases: HashMap::new(),
             closing: Vec::new(),
             hellos: Vec::new(),
             generations: HashMap::new(),
@@ -402,7 +430,7 @@ impl Endpoint {
         if !r.is_null() {
             self.hellos.push(r);
         }
-        self.bind(peer.clone(), ep, ffi_now());
+        self.bind(peer.clone(), ep, ffi_now(), true);
         Ok(())
     }
 
@@ -418,6 +446,73 @@ impl Endpoint {
             self.owner.remove(&(p.ep as usize));
             self.close_ep(p.ep);
         }
+        for ep in self.aliases_of(peer) {
+            self.aliases.remove(&ep);
+            self.close_ep(ep as *mut c_void);
+        }
+    }
+
+    fn aliases_of(&self, peer: &LogicalId) -> Vec<usize> {
+        self.aliases
+            .iter()
+            .filter(|(_, p)| *p == peer)
+            .map(|(&e, _)| e)
+            .collect()
+    }
+
+    /// The link to `peer` failed: a parked endpoint of a crossed connect
+    /// (if any) becomes the link, as a new incarnation (the peer restarted
+    /// and connected to us while our connect to its old incarnation won).
+    fn promote_alias(&mut self, peer: &LogicalId, ts_ns: u64) {
+        if let Some(&ep) = self.aliases_of(peer).first() {
+            self.aliases.remove(&ep);
+            self.bind(peer.clone(), ep as *mut c_void, ts_ns, false);
+        }
+    }
+
+    /// An inbound hello from `peer` while our own connect to it is bound:
+    /// both sides connected at once. Both sides keep the connection opened
+    /// by the lower id, without any message exchange (the decision only
+    /// needs the two ids, which both sides know). Returns true if handled.
+    fn crossed_connect(&mut self, peer: &LogicalId, ep: *mut c_void, ts_ns: u64) -> bool {
+        let Some(p) = self.peers.get(peer) else {
+            return false;
+        };
+        if !p.outbound {
+            return false;
+        }
+        if self.me < *peer {
+            // Ours wins: park theirs; the peer switches to ours and closes it.
+            self.aliases.insert(ep as usize, peer.clone());
+            self.stats.crossed_connects += 1;
+            return true;
+        }
+        if p.confirmed {
+            // The peer has used our connection: this is a new incarnation
+            // connecting, not a crossed connect (bind handles the rejoin).
+            return false;
+        }
+        // Theirs wins: switch to it. Same incarnation, so no rejoin; our
+        // connection closes after its in-flight operations complete.
+        let old = self.peers.get_mut(peer).unwrap();
+        let old_ep = std::mem::replace(&mut old.ep, ep);
+        old.outbound = false;
+        old.last_heard = now_ns();
+        self.owner.remove(&(old_ep as usize));
+        self.owner.insert(ep as usize, peer.clone());
+        unsafe { ffi::cx_forget_ep(self.ctx, old_ep) };
+        let r = unsafe { ffi::cx_ep_close(old_ep, 0) };
+        self.stats.eps_closed += 1;
+        if !r.is_null() {
+            self.closing.push(r);
+        }
+        self.stats.crossed_connects += 1;
+        self.emit(Event::PeerJoined {
+            peer: peer.clone(),
+            rejoin: false,
+            ts_ns,
+        });
+        true
     }
 
     pub fn is_connected(&self, peer: &LogicalId) -> bool {
@@ -443,7 +538,7 @@ impl Endpoint {
         s
     }
 
-    fn bind(&mut self, peer: LogicalId, ep: *mut c_void, ts_ns: u64) {
+    fn bind(&mut self, peer: LogicalId, ep: *mut c_void, ts_ns: u64, outbound: bool) {
         let prefix = peer.tag_prefix();
         if let Some(other) = self.prefixes.get(&prefix) {
             if *other != peer {
@@ -464,10 +559,16 @@ impl Endpoint {
                 last_heard: now,
                 last_ping: 0,
                 heard: false,
+                outbound,
+                confirmed: false,
             },
         ) {
-            self.owner.remove(&(old.ep as usize));
-            self.close_ep(old.ep);
+            // The same address means the old endpoint is gone and UCX gave
+            // its memory to this one: nothing to close.
+            if old.ep != ep {
+                self.owner.remove(&(old.ep as usize));
+                self.close_ep(old.ep);
+            }
         }
         self.owner.insert(ep as usize, peer.clone());
         if rejoin {
@@ -481,6 +582,7 @@ impl Endpoint {
     }
 
     fn close_ep(&mut self, ep: *mut c_void) {
+        unsafe { ffi::cx_forget_ep(self.ctx, ep) };
         let r = unsafe { ffi::cx_ep_close(ep, 1) };
         self.stats.eps_closed += 1;
         if !r.is_null() {
@@ -552,11 +654,12 @@ impl Endpoint {
                 self.stats.failures += 1;
                 self.stats.heartbeat_failures += 1;
                 self.emit(Event::PeerFailed {
-                    peer: Some(id),
+                    peer: Some(id.clone()),
                     status: 0,
                     reason: "heartbeat timeout".into(),
                     ts_ns: now,
                 });
+                self.promote_alias(&id, now);
             }
         }
     }
@@ -577,8 +680,8 @@ impl Endpoint {
                     return;
                 };
                 let key = ev.ep as usize;
-                if self.anon.remove(&key) {
-                    self.bind(peer, ev.ep, ev.ts_ns);
+                if self.anon.remove(&key) && !self.crossed_connect(&peer, ev.ep, ev.ts_ns) {
+                    self.bind(peer, ev.ep, ev.ts_ns, false);
                 }
             }
             ffi::EV_HB => {
@@ -587,6 +690,7 @@ impl Endpoint {
                     if let Some(p) = self.peers.get_mut(id) {
                         p.last_heard = p.last_heard.max(ev.ts_ns);
                         p.heard = true;
+                        p.confirmed = true;
                     }
                     if ev.data[0] == b'P' {
                         let r = unsafe { ffi::cx_hb(ev.ep, 1) };
@@ -605,7 +709,17 @@ impl Endpoint {
                     unsafe { ffi::cx_free(ev.payload) };
                     v
                 };
-                if let Some(peer) = self.owner.get(&(ev.ep as usize)).cloned() {
+                let key = ev.ep as usize;
+                let peer = match self.owner.get(&key) {
+                    Some(id) => {
+                        if let Some(p) = self.peers.get_mut(id) {
+                            p.confirmed = true;
+                        }
+                        Some(id.clone())
+                    }
+                    None => self.aliases.get(&key).cloned(),
+                };
+                if let Some(peer) = peer {
                     let hdr = ev.data[..ev.len as usize].to_vec();
                     self.emit(Event::Am {
                         peer,
@@ -618,16 +732,20 @@ impl Endpoint {
             ffi::EV_ERROR => {
                 let key = ev.ep as usize;
                 let reason = ffi::status_string(ev.status);
-                if let Some(peer) = self.owner.remove(&key) {
+                if self.aliases.remove(&key).is_some() {
+                    // the losing side of a crossed connect, closed by the peer
+                    self.close_ep(ev.ep);
+                } else if let Some(peer) = self.owner.remove(&key) {
                     self.peers.remove(&peer);
                     self.close_ep(ev.ep);
                     self.stats.failures += 1;
                     self.emit(Event::PeerFailed {
-                        peer: Some(peer),
+                        peer: Some(peer.clone()),
                         status: ev.status,
                         reason,
                         ts_ns: ev.ts_ns,
                     });
+                    self.promote_alias(&peer, ev.ts_ns);
                 } else if self.anon.remove(&key) {
                     self.close_ep(ev.ep);
                     self.emit(Event::PeerFailed {
@@ -1052,7 +1170,8 @@ impl Drop for Endpoint {
         for ep in eps {
             self.close_ep(ep);
         }
-        let anon: Vec<_> = self.anon.drain().collect();
+        let mut anon: Vec<_> = self.anon.drain().collect();
+        anon.extend(self.aliases.drain().map(|(e, _)| e));
         for ep in anon {
             self.close_ep(ep as *mut c_void);
         }

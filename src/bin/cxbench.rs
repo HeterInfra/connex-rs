@@ -314,8 +314,9 @@ fn survivor(a: &Args) {
         .expect("listen");
     let ctl_l = TcpListener::bind(("0.0.0.0", a.num("ctl-port", 13338) as u16)).expect("ctl bind");
     ctl_l.set_nonblocking(true).unwrap();
+    let ctl_port = ctl_l.local_addr().map(|a| a.port()).unwrap_or(0);
     println!(
-        "{{\"type\":\"ready\",\"port\":{port},\"tls\":\"{}\"}}",
+        "{{\"type\":\"ready\",\"port\":{port},\"ctl_port\":{ctl_port},\"tls\":\"{}\"}}",
         ucx_tls()
     );
 
@@ -454,7 +455,12 @@ fn survivor(a: &Args) {
                 let s = ep.post_send(&peer, step, io.sbuf.clone());
                 match (s, r) {
                     (Ok(s), Ok(r)) => inflight.push_back((expect, s, r)),
-                    _ => {
+                    (s, r) => {
+                        // Give up the half that was posted (cancels a posted
+                        // receive; dropping it would leave it matchable).
+                        for op in [s, r].into_iter().flatten() {
+                            let _ = ep.wait(op, Some(Duration::from_millis(1)));
+                        }
                         data_err_ts.get_or_insert(now_ns());
                         break;
                     }

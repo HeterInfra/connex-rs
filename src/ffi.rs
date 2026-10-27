@@ -60,6 +60,7 @@ extern "C" {
         ep_out: *mut *mut c_void,
     ) -> c_int;
     pub fn cx_ep_close(ep: *mut c_void, force: c_int) -> *mut c_void;
+    pub fn cx_forget_ep(c: *mut CxCtx, ep: *mut c_void);
     pub fn cx_is_err(r: *mut c_void) -> c_int;
     pub fn cx_hello(ep: *mut c_void, buf: *const c_void, len: size_t) -> *mut c_void;
     pub fn cx_hb(ep: *mut c_void, pong: c_int) -> *mut c_void;

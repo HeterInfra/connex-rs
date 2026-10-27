@@ -280,3 +280,65 @@ fn links_both_ways_are_one_endpoint_and_report_up() {
     }
     assert!(!saw_up);
 }
+
+/// Both sides connect at the same moment (a's link-up connect crossing b's
+/// first read of a, as a pipeline's peer watcher and data path do). The two
+/// connections must converge on one link: no failure event, PeerUp exactly
+/// once per side, the read in flight completes, and both directions work.
+#[test]
+fn crossed_connects_converge() {
+    let ip = setup();
+    let mut crossed = 0;
+    for round in 0..20u32 {
+        let a = engine(&ip, 0, 0);
+        let b = engine(&ip, 1, 0);
+        let n = 64 << 10;
+        let (src_a, dst_a) = (a.alloc_managed(n).unwrap(), a.alloc_managed(n).unwrap());
+        let (src_b, dst_b) = (b.alloc_managed(n).unwrap(), b.alloc_managed(n).unwrap());
+        let want_a = fill(&a, src_a, n, round as u8);
+        let want_b = fill(&b, src_b, n, round as u8 ^ 0x5a);
+        let go = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                go.wait();
+                a.connect(b.local_url()).unwrap();
+            });
+            s.spawn(|| {
+                go.wait();
+                if round % 2 == 0 {
+                    b.get(a.local_url(), dst_b, src_a, n as u64, T).unwrap();
+                } else {
+                    b.connect(a.local_url()).unwrap();
+                    b.get(a.local_url(), dst_b, src_a, n as u64, T).unwrap();
+                }
+            });
+        });
+        assert_eq!(read(dst_b, n), want_a, "round {round}: read in flight");
+        a.get(b.local_url(), dst_a, src_b, n as u64, T).unwrap();
+        assert_eq!(read(dst_a, n), want_b, "round {round}: a reads b");
+        b.get(a.local_url(), dst_b, src_a, n as u64, T).unwrap();
+        let (mut up_a, mut up_b) = (0, 0);
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(300) {
+            while let Some(ev) = a.wait_event(Some(Duration::from_millis(5))) {
+                assert!(
+                    !matches!(ev, Event::PeerFailed { .. }),
+                    "round {round} a: {ev:?}"
+                );
+                up_a += matches!(ev, Event::PeerUp { .. }) as u32;
+            }
+            while let Some(ev) = b.wait_event(Some(Duration::from_millis(5))) {
+                assert!(
+                    !matches!(ev, Event::PeerFailed { .. }),
+                    "round {round} b: {ev:?}"
+                );
+                up_b += matches!(ev, Event::PeerUp { .. }) as u32;
+            }
+        }
+        assert_eq!((up_a, up_b), (1, 1), "round {round}: PeerUp once per side");
+        assert_eq!(a.stats().ep.live_peers, 1);
+        assert_eq!(b.stats().ep.live_peers, 1);
+        crossed += a.stats().ep.crossed_connects + b.stats().ep.crossed_connects;
+    }
+    assert!(crossed > 0, "no round actually crossed");
+}
