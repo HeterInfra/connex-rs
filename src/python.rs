@@ -534,6 +534,46 @@ impl PyEngine {
         Ok(PyTransfer { c })
     }
 
+    /// Armed put chain (see connex_rs ChainSpec): once the u32 at local
+    /// `doorbell` reaches `doorbell_val` and the peer's u32 at `gate`
+    /// reaches `gate_val`, put `length` bytes src -> dst, then (remotely
+    /// complete) the u32 `flag_val` to the peer's `flag`. Runs on the
+    /// progress thread; chains of one `queue` run in order.
+    #[pyo3(signature = (remote_url, doorbell, doorbell_val, gate, gate_val, src_ptr, dst_ptr,
+                        length, flag, flag_val, queue=0, timeout_ms=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn put_chain(
+        &self,
+        remote_url: &str,
+        doorbell: u64,
+        doorbell_val: u32,
+        gate: u64,
+        gate_val: u32,
+        src_ptr: u64,
+        dst_ptr: u64,
+        length: u64,
+        flag: u64,
+        flag_val: u32,
+        queue: u64,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<PyTransfer> {
+        let spec = crate::engine::ChainSpec {
+            doorbell,
+            doorbell_val,
+            gate,
+            gate_val,
+            src: src_ptr,
+            dst: dst_ptr,
+            len: length,
+            flag,
+            flag_val,
+            queue,
+            timeout: ms(timeout_ms),
+        };
+        let c = self.e.put_chain(remote_url, spec).map_err(to_py)?;
+        Ok(PyTransfer { c })
+    }
+
     /// Sends a message to a peer given by URL (connects on demand) or by
     /// logical-id tuple (an already connected peer).
     fn send_msg(&self, py: Python<'_>, peer: &Bound<'_, PyAny>, data: Vec<u8>) -> PyResult<()> {

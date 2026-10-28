@@ -161,6 +161,66 @@ fn put_signal_orders_data_before_message() {
 }
 
 #[test]
+fn put_chain_waits_for_doorbell_and_gate_then_flags_after_data() {
+    use connex_rs::engine::ChainSpec;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let ip = setup();
+    let a = engine(&ip, 0, 0);
+    let b = engine(&ip, 1, 0);
+    let n = 1 << 20;
+    let src = a.alloc_managed(n).unwrap();
+    let dst = b.alloc_managed(n + 64).unwrap();
+    let flag = dst + n as u64; // ready word, then the gate ("free") word
+    let gate = flag + 4;
+    let bell = Box::new(AtomicU32::new(0));
+    let word = |p: u64| unsafe { &*(p as *const AtomicU32) };
+    let spec = |v: u32, g: u32| ChainSpec {
+        doorbell: bell.as_ref() as *const AtomicU32 as u64,
+        doorbell_val: v,
+        gate: if g > 0 { gate } else { 0 },
+        gate_val: g,
+        src,
+        dst,
+        len: n as u64,
+        flag,
+        flag_val: v,
+        queue: 7,
+        timeout: T,
+    };
+    for v in 1..=20u32 {
+        let want = fill(&a, src, n, v as u8);
+        let c = a
+            .put_chain(b.local_url(), spec(v, v.saturating_sub(1)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(!c.is_done(), "ran before the doorbell");
+        assert_eq!(word(flag).load(Ordering::Acquire), v - 1);
+        if v > 1 {
+            // doorbell rung, gate not yet open: still waiting
+            bell.store(v, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(!c.is_done(), "ran before the gate opened");
+            word(gate).store(v - 1, Ordering::Release);
+        } else {
+            bell.store(v, Ordering::Release);
+        }
+        let t0 = Instant::now();
+        while word(flag).load(Ordering::Acquire) != v {
+            assert!(t0.elapsed() < Duration::from_secs(5), "flag never came");
+        }
+        assert_eq!(read(dst, n), want, "data in place when the flag is set");
+        c.wait(None).unwrap().unwrap();
+    }
+    // chains of one queue run in order; the cancel value drops a waiting one
+    let c1 = a.put_chain(b.local_url(), spec(30, 0)).unwrap();
+    let c2 = a.put_chain(b.local_url(), spec(31, 0)).unwrap();
+    bell.store(0x7FFF_FFFF, Ordering::Release);
+    assert!(matches!(c1.wait(T), Some(Err(Error::Canceled))));
+    assert!(matches!(c2.wait(T), Some(Err(Error::Canceled))));
+    assert_eq!(word(flag).load(Ordering::Acquire), 20);
+}
+
+#[test]
 fn peer_failure_and_same_identity_rejoin() {
     let ip = setup();
     let b = engine(&ip, 1, 0);
