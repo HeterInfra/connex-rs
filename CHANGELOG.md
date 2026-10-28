@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.4
 
 - `Engine.put_chain` (Rust and Python): an armed put that the progress
   thread runs on its own. It waits until a u32 in local memory (a
