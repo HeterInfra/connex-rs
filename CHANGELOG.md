@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- `Engine.put_chain` (Rust and Python): an armed put that the progress
+  thread runs on its own. It waits until a u32 in local memory (a
+  "doorbell", typically written by a CUDA stream with
+  `cuStreamWriteValue32`) reaches a value, optionally until a u32 in the
+  peer's memory reaches a value (polled with one-sided reads; a credit
+  gate for ring slots), then puts the data, reads its last word back, and
+  puts a u32 flag to the peer. The peer can wait for the flag on the GPU
+  (`cuStreamWaitValue32` on registered host memory) and use the data with
+  no application thread on either side involved. The read-back makes the
+  data visible before the flag also on GPUs that do not order inbound RDMA
+  writes (GDR flush, as NCCL does). Chains with the same `queue` run in
+  order; the value 0x7FFFFFFF in the doorbell or the gate cancels. While
+  chains are armed the progress thread polls every few microseconds
+  instead of sleeping (its timer slack is now 1 µs). Used by Connex's
+  pipeline-parallel plugin for cross-host stage hops.
+- Known limit: a very small put from GPU memory (16 bytes here) takes
+  UCX's inline path, which reads the source with the CPU and crashes (HPC-X
+  2.18 UCX, rc_mlx5, also with the memory handle given); stage small
+  payloads in host memory. 16 KB and larger from GPU memory is fine.
+
 ## 0.1.3
 
 - Simultaneous connects between two peers (each side connecting to the

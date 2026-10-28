@@ -173,6 +173,13 @@ impl Completion {
         self.m.lock().unwrap().is_some()
     }
 
+    fn result(&self) -> Option<Result<()>> {
+        if !self.flag.load(Ordering::Acquire) {
+            return None;
+        }
+        self.m.lock().unwrap().clone()
+    }
+
     /// Waits for the result. `None` timeout waits forever. A wait that
     /// times out leaves the operation running (it has its own deadline).
     pub fn wait(&self, timeout: Option<Duration>) -> Option<Result<()>> {
@@ -223,6 +230,12 @@ enum Cmd {
     Msg {
         to: Target,
         data: Vec<u8>,
+        done: Arc<Completion>,
+    },
+    Chain {
+        cuda_ctx: usize,
+        url: PeerUrl,
+        spec: ChainSpec,
         done: Arc<Completion>,
     },
     Connect {
@@ -486,6 +499,20 @@ impl Engine {
         self.rma_async(url, true, src, dst, len, timeout, Some(msg))
     }
 
+    /// An armed put chain (see [`ChainSpec`]): runs on the progress thread
+    /// once the local doorbell reaches its value, without the caller.
+    pub fn put_chain(&self, url: &str, spec: ChainSpec) -> Result<Arc<Completion>> {
+        let url = PeerUrl::parse(url)?;
+        let done = Completion::new();
+        self.shared.push(Cmd::Chain {
+            cuda_ctx: crate::cuda_ctx_current(),
+            url,
+            spec,
+            done: done.clone(),
+        });
+        Ok(done)
+    }
+
     /// Sends a message (signal) to a peer. Completes once handed to UCX.
     pub fn send_msg(&self, to: Target, data: Vec<u8>) -> Result<()> {
         self.call(|done| Cmd::Msg { to, data, done }, None)
@@ -629,6 +656,45 @@ struct Inflight {
     done: Arc<Completion>,
 }
 
+/// A put chain: the progress thread waits until the u32 at the local
+/// `doorbell` address reaches `doorbell_val` (typically written by a GPU
+/// stream with `cuStreamWriteValue32`; 0x7FFFFFFF cancels), then until the
+/// u32 at the peer's `gate` address reaches `gate_val` (polled with
+/// one-sided reads), then puts `len` bytes from local `src` to the peer's
+/// `dst`, reads its last word back (so the data is in the peer's memory
+/// even where a GPU does not order RDMA writes), then puts the u32 `flag_val`
+/// to the peer's `flag` address. The peer can therefore wait for `flag`
+/// (e.g. `cuStreamWaitValue32` on host memory) and then use the data,
+/// with no thread of either side's application on the path. Chains with
+/// the same `queue` run strictly in order. Zero addresses skip a step.
+#[derive(Clone, Debug, Default)]
+pub struct ChainSpec {
+    pub doorbell: u64,
+    pub doorbell_val: u32,
+    pub gate: u64,
+    pub gate_val: u32,
+    pub src: u64,
+    pub dst: u64,
+    pub len: u64,
+    pub flag: u64,
+    pub flag_val: u32,
+    pub queue: u64,
+    /// Deadline of each RMA of the chain (not of the doorbell wait).
+    pub timeout: Option<Duration>,
+}
+
+const CANCEL: u32 = 0x7FFF_FFFF;
+
+struct Chain {
+    peer: LogicalId,
+    spec: ChainSpec,
+    stage: u8,
+    cur: Option<Arc<Completion>>,
+    /// Gate read destination and flag put source (host, unregistered).
+    scratch: Box<[u32; 2]>,
+    done: Arc<Completion>,
+}
+
 struct PendingUnreg {
     addr: u64,
     acks: HashSet<LogicalId>,
@@ -642,6 +708,7 @@ struct State {
     local: BTreeMap<u64, LocalRegion>,
     remote: HashMap<LogicalId, RemotePeer>,
     inflight: Vec<Inflight>,
+    chains: HashMap<u64, VecDeque<Chain>>,
     unreg: Vec<PendingUnreg>,
     /// Requests whose callers were already answered (peer closed); UCX
     /// completes them with an error later and they are freed then.
@@ -702,12 +769,14 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         }
     }
     let _ = ready.send(Ok(port));
+    unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1000 as libc::c_ulong, 0, 0, 0) };
     let mut st = State {
         ep,
         sh: sh.clone(),
         local: BTreeMap::new(),
         remote: HashMap::new(),
         inflight: Vec::new(),
+        chains: HashMap::new(),
         unreg: Vec::new(),
         orphans: Vec::new(),
         pending_up: Vec::new(),
@@ -727,9 +796,20 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         work |= st.drain_cmds();
         work |= st.drain_events();
         work |= st.check_inflight();
+        work |= st.check_chains();
         st.check_unreg();
         if work {
             last_work = Instant::now();
+            continue;
+        }
+        if !st.chains.is_empty() {
+            // Armed chains poll their doorbells: no long sleep (the timer
+            // slack of this thread is 1 µs, so this is about 5-10 µs).
+            if last_work.elapsed() >= spin {
+                std::thread::sleep(Duration::from_micros(5));
+            } else {
+                std::hint::spin_loop();
+            }
             continue;
         }
         if last_work.elapsed() < spin {
@@ -783,6 +863,11 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
     for o in st.inflight.drain(..) {
         o.done.set(Err(Error::Canceled));
     }
+    for (_, q) in st.chains.drain() {
+        for c in q {
+            c.done.set(Err(Error::Canceled));
+        }
+    }
     for (_, p) in st.remote.drain() {
         for w in p.waiting {
             w.done.set(Err(Error::Canceled));
@@ -814,6 +899,7 @@ fn fail_cmd(c: Cmd, e: Error) {
         | Cmd::Unregister { done, .. }
         | Cmd::Rma { done, .. }
         | Cmd::Msg { done, .. }
+        | Cmd::Chain { done, .. }
         | Cmd::Connect { done, .. }
         | Cmd::Disconnect { done, .. } => done.set(Err(e)),
         Cmd::Stats { .. } => {}
@@ -925,6 +1011,26 @@ impl State {
                     done,
                 };
                 self.start_rma(&url.id, w);
+            }
+            Cmd::Chain {
+                cuda_ctx,
+                url,
+                spec,
+                done,
+            } => {
+                self.use_cuda_ctx(cuda_ctx);
+                if let Err(e) = self.ensure_connected(&url) {
+                    done.set(Err(e));
+                    return;
+                }
+                self.chains.entry(spec.queue).or_default().push_back(Chain {
+                    peer: url.id.clone(),
+                    spec,
+                    stage: 0,
+                    cur: None,
+                    scratch: Box::new([0, 0]),
+                    done,
+                });
             }
             Cmd::Msg { to, data, done } => {
                 if let Target::Url(u) = &to {
@@ -1186,6 +1292,163 @@ impl State {
                 let _ = self.ep.am_send(peer, hdr(K_INVAL_ACK, &[base]), Vec::new());
             }
         }
+    }
+
+    fn check_chains(&mut self) -> bool {
+        if self.chains.is_empty() {
+            return false;
+        }
+        let mut chains = std::mem::take(&mut self.chains);
+        let mut progressed = false;
+        for q in chains.values_mut() {
+            while let Some(c) = q.front_mut() {
+                match self.step_chain(c) {
+                    None => break,
+                    Some(r) => {
+                        let c = q.pop_front().unwrap();
+                        c.done.set(r);
+                        progressed = true;
+                    }
+                }
+            }
+        }
+        chains.retain(|_, q| !q.is_empty());
+        // Commands handled inside step_chain cannot add chains (they come
+        // only from drain_cmds), so nothing is lost by the swap.
+        self.chains = chains;
+        progressed
+    }
+
+    /// Advances one chain; Some(result) once it is finished.
+    fn step_chain(&mut self, c: &mut Chain) -> Option<Result<()>> {
+        loop {
+            match c.stage {
+                0 => {
+                    if c.spec.doorbell != 0 {
+                        let v = unsafe { std::ptr::read_volatile(c.spec.doorbell as *const u32) };
+                        std::sync::atomic::fence(Ordering::Acquire);
+                        if v == CANCEL {
+                            return Some(Err(Error::Canceled));
+                        }
+                        if (v as i32) < (c.spec.doorbell_val as i32) {
+                            return None;
+                        }
+                    }
+                    c.stage = 1;
+                }
+                1 => {
+                    if c.spec.gate == 0 {
+                        c.stage = 2;
+                        continue;
+                    }
+                    match &c.cur {
+                        None => {
+                            let ptr = c.scratch.as_mut_ptr() as u64;
+                            c.cur = Some(self.chain_rma(
+                                &c.peer,
+                                false,
+                                ptr,
+                                c.spec.gate,
+                                4,
+                                c.spec.timeout,
+                            ));
+                            return None;
+                        }
+                        Some(d) => match d.result()? {
+                            Err(e) => return Some(Err(e)),
+                            Ok(()) => {
+                                c.cur = None;
+                                let v = unsafe { std::ptr::read_volatile(c.scratch.as_ptr()) };
+                                if v == CANCEL {
+                                    return Some(Err(Error::Canceled));
+                                }
+                                if (v as i32) < (c.spec.gate_val as i32) {
+                                    return None; // read again next round
+                                }
+                                c.stage = 2;
+                            }
+                        },
+                    }
+                }
+                3 => {
+                    // Read back the last word of the data before the flag:
+                    // a read cannot pass the writes before it on the
+                    // peer's PCIe path, so once it returns the data is in
+                    // the peer's (GPU) memory, also where the GPU does not
+                    // order RDMA writes (GDR "flush", as NCCL does it).
+                    if c.spec.dst == 0 || c.spec.len < 4 {
+                        c.stage = 4;
+                        continue;
+                    }
+                    match &c.cur {
+                        None => {
+                            let ptr = c.scratch.as_mut_ptr() as u64;
+                            let at = c.spec.dst + (c.spec.len & !3) - 4;
+                            c.cur =
+                                Some(self.chain_rma(&c.peer, false, ptr, at, 4, c.spec.timeout));
+                            return None;
+                        }
+                        Some(d) => match d.result()? {
+                            Err(e) => return Some(Err(e)),
+                            Ok(()) => {
+                                c.cur = None;
+                                c.stage = 4;
+                            }
+                        },
+                    }
+                }
+                2 | 4 => {
+                    let (src, dst, len) = if c.stage == 2 {
+                        (c.spec.src, c.spec.dst, c.spec.len)
+                    } else {
+                        c.scratch[1] = c.spec.flag_val;
+                        (unsafe { c.scratch.as_ptr().add(1) } as u64, c.spec.flag, 4)
+                    };
+                    if dst == 0 || len == 0 {
+                        c.stage += 1;
+                        continue;
+                    }
+                    match &c.cur {
+                        None => {
+                            c.cur =
+                                Some(self.chain_rma(&c.peer, true, src, dst, len, c.spec.timeout));
+                            return None;
+                        }
+                        Some(d) => match d.result()? {
+                            Err(e) => return Some(Err(e)),
+                            Ok(()) => {
+                                c.cur = None;
+                                c.stage += 1;
+                            }
+                        },
+                    }
+                }
+                _ => return Some(Ok(())),
+            }
+        }
+    }
+
+    fn chain_rma(
+        &mut self,
+        peer: &LogicalId,
+        is_put: bool,
+        local: u64,
+        remote: u64,
+        len: u64,
+        timeout: Option<Duration>,
+    ) -> Arc<Completion> {
+        let done = Completion::new();
+        let w = WaitingRma {
+            is_put,
+            local,
+            remote,
+            len,
+            deadline: Instant::now() + timeout.unwrap_or(DEFAULT_OP_TIMEOUT),
+            signal: None,
+            done: done.clone(),
+        };
+        self.start_rma(peer, w);
+        done
     }
 
     fn check_unreg(&mut self) {
