@@ -6,11 +6,16 @@ use connex_rs::{Error, Event, LogicalId};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Sets the UCX environment once: tests run on parallel threads, and a
+/// `setenv` while another test's UCX calls `getenv` is a data race.
 fn setup() -> String {
-    let tls = std::env::var("CONNEX_RS_TEST_TLS").unwrap_or_else(|_| "tcp".into());
-    std::env::set_var("UCX_TLS", tls);
-    std::env::set_var("UCX_WARN_UNUSED_ENV_VARS", "n");
-    std::env::set_var("UCX_TCP_CM_REUSEADDR", "y");
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| {
+        let tls = std::env::var("CONNEX_RS_TEST_TLS").unwrap_or_else(|_| "tcp".into());
+        std::env::set_var("UCX_TLS", tls);
+        std::env::set_var("UCX_WARN_UNUSED_ENV_VARS", "n");
+        std::env::set_var("UCX_TCP_CM_REUSEADDR", "y");
+    });
     std::env::var("CONNEX_RS_TEST_IP").unwrap_or_else(|_| "127.0.0.1".into())
 }
 
@@ -233,6 +238,9 @@ fn put_chain_cancel_word_wrap_and_deadlines() {
     let dst = b.alloc_managed(n + 64).unwrap();
     let flag = dst + n as u64;
     let gate = flag + 4;
+    // Wire up and fetch the rkey first: the chains below have 300 ms
+    // deadlines, which RDMA wireup alone can exceed while other tests run.
+    a.put(b.local_url(), src, dst, n as u64, T).unwrap();
     let bell = Box::new(AtomicU32::new(0));
     let cancel = Box::new(AtomicU32::new(0));
     let word = |p: u64| unsafe { &*(p as *const AtomicU32) };
@@ -486,4 +494,98 @@ fn crossed_connects_converge() {
         crossed += a.stats().ep.crossed_connects + b.stats().ep.crossed_connects;
     }
     assert!(crossed > 0, "no round actually crossed");
+}
+
+// ---------------------------------------------------------------- review regressions
+
+/// Runs `f` on a thread and fails (instead of hanging) if it does not
+/// return within `t`.
+fn within<R: Send + 'static>(t: Duration, f: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(t).expect("call did not return in time")
+}
+
+#[test]
+fn recv_msg_returns_after_shutdown() {
+    let ip = setup();
+    let a = Arc::new(engine(&ip, 0, 0));
+    let a2 = a.clone();
+    let h = std::thread::spawn(move || a2.recv_msg(None));
+    std::thread::sleep(Duration::from_millis(100));
+    a.shutdown();
+    let r = within(Duration::from_secs(5), move || h.join().unwrap());
+    assert!(r.is_none());
+}
+
+#[test]
+fn huge_timeouts_do_not_panic() {
+    let ip = setup();
+    let a = engine(&ip, 0, 0);
+    let b = engine(&ip, 1, 0);
+    let src = a.alloc_managed(4096).unwrap();
+    let dst = b.alloc_managed(4096).unwrap();
+    let want = fill(&a, src, 4096, 5);
+    let max = Some(Duration::MAX);
+    b.get(a.local_url(), dst, src, 4096, max).unwrap();
+    assert_eq!(read(dst, 4096), want);
+    let c = b
+        .rma_async(a.local_url(), false, dst, src, 4096, max, None)
+        .unwrap();
+    assert_eq!(c.wait(max), Some(Ok(())));
+    assert!(b.recv_msg(Some(Duration::from_millis(1))).is_none());
+    assert!(a.wait_event(Some(Duration::from_secs(u64::MAX))).is_some());
+}
+
+#[test]
+fn rma_length_overflow_is_rejected() {
+    let ip = setup();
+    let a = engine(&ip, 0, 0);
+    let b = engine(&ip, 1, 0);
+    let src = a.alloc_managed(8192).unwrap();
+    let dst = b.alloc_managed(8192).unwrap();
+    // Prime the rkey cache so the lookup runs on the cached region.
+    b.get(a.local_url(), dst, src, 8192, T).unwrap();
+    // remote + len wraps around to inside the region
+    let r = b.get(a.local_url(), dst, src + 16, u64::MAX - 8, T);
+    assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    let r = b.get(a.local_url(), dst, src, 0, T);
+    assert!(r.is_ok() || matches!(r, Err(Error::Invalid(_))), "{r:?}");
+    // still usable
+    let want = fill(&a, src, 8192, 9);
+    b.get(a.local_url(), dst, src, 8192, T).unwrap();
+    assert_eq!(read(dst, 8192), want);
+}
+
+#[test]
+fn unregister_waits_for_local_inflight_rma() {
+    let ip = setup();
+    let a = engine(&ip, 0, 0);
+    let b = engine(&ip, 1, 0);
+    let n: usize = 256 << 20;
+    let src = a.alloc_managed(n).unwrap();
+    let want = fill(&a, src, n, 1);
+    let mut buf = vec![0u8; n];
+    let dst = buf.as_mut_ptr() as u64;
+    b.register(dst, n as u64).unwrap();
+    // Warm up (connection + rkey).
+    b.get(a.local_url(), dst, src, 4096, T).unwrap();
+    let c = b
+        .rma_async(
+            a.local_url(),
+            false,
+            dst,
+            src,
+            n as u64,
+            Some(Duration::from_secs(30)),
+            None,
+        )
+        .unwrap();
+    // The local buffer's registration must outlive the read using it.
+    b.unregister(dst).unwrap();
+    assert_eq!(c.wait(None), Some(Ok(())));
+    assert!(read(dst, n) == want, "data intact");
+    drop(buf);
 }

@@ -27,7 +27,10 @@
 //! restarted sender that comes back under the same id and address is the
 //! same peer, and failure events name logical ids.
 
-use crate::{Endpoint, Error, Event, Heartbeat, LogicalId, MemRegion, Req, Result, Rkey};
+use crate::{
+    deadline_in, debug_enabled, Endpoint, Error, Event, Heartbeat, LogicalId, MemRegion, Req,
+    Result, Rkey,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +48,27 @@ const K_MSG: u8 = 5;
 pub const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long an unregister waits for readers to drop their cached rkeys.
 const INVAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Op deadline `t` from now; a timeout too large to represent is a deadline
+/// that never comes (about a century).
+fn op_deadline(t: Duration) -> Instant {
+    deadline_in(t)
+        .or_else(|| deadline_in(Duration::from_secs(100 * 365 * 86_400)))
+        .unwrap_or_else(Instant::now)
+}
+
+/// `addr..addr+len` does not wrap around the address space.
+fn range_ok(addr: u64, len: u64) -> bool {
+    addr.checked_add(len).is_some() && len <= isize::MAX as u64
+}
+
+/// `a..a+alen` lies inside `b..b+blen` (no overflow).
+fn within(a: u64, alen: u64, b: u64, blen: u64) -> bool {
+    match (a.checked_add(alen), b.checked_add(blen)) {
+        (Some(ae), Some(be)) => a >= b && ae <= be,
+        _ => false,
+    }
+}
 
 /// Parsed peer URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +212,7 @@ impl Completion {
             std::hint::spin_loop();
         }
         let mut g = self.m.lock().unwrap();
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout.and_then(deadline_in);
         while g.is_none() {
             match deadline {
                 None => g = self.cv.wait(g).unwrap(),
@@ -266,6 +290,16 @@ struct Shared {
 }
 
 impl Shared {
+    /// Wakes `wait_event` / `recv_msg` callers after `stop` was set. The
+    /// locks are taken so that a waiter between its `stop` check and its
+    /// condvar wait cannot miss the notification.
+    fn wake_waiters(&self) {
+        drop(self.events.lock().unwrap());
+        self.events_cv.notify_all();
+        drop(self.msgs.lock().unwrap());
+        self.msgs_cv.notify_all();
+    }
+
     fn push(&self, c: Cmd) {
         {
             let mut q = self.cmds.lock().unwrap();
@@ -284,6 +318,15 @@ impl Shared {
     fn kick(&self) {
         let one: u64 = 1;
         unsafe { libc::write(self.cmd_fd, &one as *const u64 as *const libc::c_void, 8) };
+    }
+}
+
+/// The command fd lives as long as anything can still kick it: a caller
+/// racing `shutdown` may kick after the thread exited, and closing the fd
+/// in `shutdown` let that write land in whatever file reused the number.
+impl Drop for Shared {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.cmd_fd) };
     }
 }
 
@@ -334,10 +377,12 @@ impl Engine {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
                 let _ = thread.join();
-                unsafe { libc::close(cmd_fd) };
                 return Err(e);
             }
-            Err(_) => return Err(Error::Invalid("progress thread died".into())),
+            Err(_) => {
+                let _ = thread.join();
+                return Err(Error::Invalid("progress thread died".into()));
+            }
         };
         let ip = cfg
             .advertise_ip
@@ -442,8 +487,13 @@ impl Engine {
         signal: Option<Vec<u8>>,
     ) -> Result<Arc<Completion>> {
         let url = PeerUrl::parse(url)?;
+        if !range_ok(local, len) || !range_ok(remote, len) {
+            return Err(Error::Invalid(format!(
+                "RMA range wraps: local {local:#x}, remote {remote:#x}, len {len}"
+            )));
+        }
         let done = Completion::new();
-        let deadline = Instant::now() + timeout.unwrap_or(DEFAULT_OP_TIMEOUT);
+        let deadline = op_deadline(timeout.unwrap_or(DEFAULT_OP_TIMEOUT));
         self.shared.push(Cmd::Rma {
             cuda_ctx: crate::cuda_ctx_current(),
             url,
@@ -503,6 +553,12 @@ impl Engine {
     /// once the local doorbell reaches its value, without the caller.
     pub fn put_chain(&self, url: &str, spec: ChainSpec) -> Result<Arc<Completion>> {
         let url = PeerUrl::parse(url)?;
+        if !range_ok(spec.src, spec.len) || !range_ok(spec.dst, spec.len) {
+            return Err(Error::Invalid(format!(
+                "put_chain range wraps: src {:#x}, dst {:#x}, len {}",
+                spec.src, spec.dst, spec.len
+            )));
+        }
         let done = Completion::new();
         self.shared.push(Cmd::Chain {
             cuda_ctx: crate::cuda_ctx_current(),
@@ -519,12 +575,16 @@ impl Engine {
     }
 
     /// Next received message, waiting up to `timeout` (None = forever).
+    /// Returns None once the engine is shut down (and the queue is empty).
     pub fn recv_msg(&self, timeout: Option<Duration>) -> Option<(LogicalId, Vec<u8>)> {
         let mut g = self.shared.msgs.lock().unwrap();
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout.and_then(deadline_in);
         loop {
             if let Some(m) = g.pop_front() {
                 return Some(m);
+            }
+            if self.shared.stop.load(Ordering::SeqCst) {
+                return None;
             }
             match deadline {
                 None => g = self.shared.msgs_cv.wait(g).unwrap(),
@@ -554,7 +614,7 @@ impl Engine {
     /// Next peer event (joined / failed), waiting up to `timeout`.
     pub fn wait_event(&self, timeout: Option<Duration>) -> Option<Event> {
         let mut g = self.shared.events.lock().unwrap();
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout.and_then(deadline_in);
         loop {
             if let Some(e) = g.pop_front() {
                 return Some(e);
@@ -590,11 +650,10 @@ impl Engine {
             self.shared.stop.store(true, Ordering::SeqCst);
             self.shared.kick();
             let _ = t.join();
-            self.shared.events_cv.notify_all();
+            self.shared.wake_waiters();
             for (_, (p, _)) in self.managed.lock().unwrap().drain() {
                 unsafe { libc::free(p as *mut libc::c_void) };
             }
-            unsafe { libc::close(self.shared.cmd_fd) };
         }
     }
 }
@@ -646,6 +705,9 @@ struct Inflight {
     peer: LogicalId,
     req: Req,
     base: u64,
+    /// Local buffer of the op (an unregister of it waits for the op).
+    local: u64,
+    len: u64,
     _rkey: Rc<Rkey>,
     deadline: Instant,
     /// Puts complete only once remotely complete (flush after the put).
@@ -922,7 +984,13 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         }
         last_work = Instant::now();
     }
-    // Shutdown: fail everything outstanding, unmap, close (Endpoint drop).
+    // Shutdown. Close every endpoint first: answering callers frees their
+    // buffers (and the chains' scratch words), and RDMA already posted on a
+    // live QP could still land there. A force-closed endpoint does no
+    // further DMA. Then fail everything outstanding, unmap, drop.
+    for p in st.ep.peers() {
+        st.ep.drop_peer(&p);
+    }
     for o in st.inflight.drain(..) {
         o.done.set(Err(Error::Canceled));
     }
@@ -953,7 +1021,7 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
     }
     unsafe { libc::close(epfd) };
     drop(st);
-    sh.events_cv.notify_all();
+    sh.wake_waiters();
 }
 
 fn fail_cmd(c: Cmd, e: Error) {
@@ -999,7 +1067,7 @@ impl State {
                 }
                 match self.ep.mem_map(addr, len) {
                     Ok(region) => {
-                        if std::env::var_os("CONNEX_RS_DEBUG").is_some() {
+                        if debug_enabled() {
                             eprintln!("connex-rs: registered {addr:#x}+{len} mem_type={} rkey={}B cuda_ctx={cuda_ctx:#x}", region.mem_type, region.rkey.len());
                         }
                         self.local.insert(
@@ -1163,7 +1231,7 @@ impl State {
         let p = self.remote.get(peer)?;
         p.regions
             .iter()
-            .find(|r| addr >= r.base && addr + len <= r.base + r.len)
+            .find(|r| within(addr, len, r.base, r.len))
             .map(|r| (r.base, r.rkey.clone()))
     }
 
@@ -1171,7 +1239,7 @@ impl State {
     /// `addr..addr+len` (null, -1 when unregistered).
     fn local_memh(&self, addr: u64, len: u64) -> (*mut std::ffi::c_void, i32) {
         if let Some((_, r)) = self.local.range(..=addr).next_back() {
-            if addr + len <= r.region.addr + r.region.len {
+            if within(addr, len, r.region.addr, r.region.len) {
                 return (r.region.memh, r.region.mem_type);
             }
         }
@@ -1226,6 +1294,8 @@ impl State {
                 peer: peer.clone(),
                 req,
                 base,
+                local: w.local,
+                len: w.len,
                 _rkey: rkey,
                 deadline: w.deadline,
                 is_put: w.is_put,
@@ -1548,7 +1618,7 @@ impl State {
             local,
             remote,
             len,
-            deadline: Instant::now() + timeout.unwrap_or(DEFAULT_OP_TIMEOUT),
+            deadline: op_deadline(timeout.unwrap_or(DEFAULT_OP_TIMEOUT)),
             signal: None,
             done: done.clone(),
         };
@@ -1565,7 +1635,16 @@ impl State {
         while i < self.unreg.len() {
             let u = &mut self.unreg[i];
             u.acks.retain(|p| self.ep.is_connected(p));
-            if u.acks.is_empty() || now >= u.deadline {
+            // Our own in-flight RMA from or into the region holds its memory
+            // handle: unmap only after it (ops have their own deadlines).
+            let (addr, rlen) = match self.local.get(&u.addr) {
+                Some(r) => (r.region.addr, r.region.len),
+                None => (u.addr, 0),
+            };
+            let busy = self.inflight.iter().any(|o| {
+                o.local < addr.saturating_add(rlen) && addr < o.local.saturating_add(o.len)
+            });
+            if !busy && (u.acks.is_empty() || now >= u.deadline) {
                 let u = self.unreg.swap_remove(i);
                 if let Some(r) = self.local.remove(&u.addr) {
                     let r = self.ep.mem_unmap(r.region);
@@ -1696,7 +1775,7 @@ impl State {
                     .range_mut(..=addr)
                     .next_back()
                     .and_then(|(_, r)| {
-                        if !r.dying && addr < r.region.addr + r.region.len {
+                        if !r.dying && addr < r.region.addr.saturating_add(r.region.len) {
                             r.readers.insert(peer.clone());
                             Some((r.region.addr, r.region.len, r.region.rkey.clone()))
                         } else {
@@ -1719,8 +1798,10 @@ impl State {
                     match self.ep.rkey_unpack(&peer, &data) {
                         Ok(rk) => {
                             let rp = self.remote.get_mut(&peer).unwrap();
-                            rp.regions
-                                .retain(|r| r.base + r.len <= base || r.base >= base + len);
+                            rp.regions.retain(|r| {
+                                r.base.saturating_add(r.len) <= base
+                                    || r.base >= base.saturating_add(len)
+                            });
                             rp.regions.push(RemoteRegion {
                                 base,
                                 len,
