@@ -14,7 +14,7 @@
 //! ep.connect(("llama-8b", 1, 0, 0), "10.0.0.2", 13337)
 //! ep.send(("llama-8b", 1, 0, 0), corr=7, data=b"...")
 //! data = ep.recv(("llama-8b", 1, 0, 0), corr=7, nbytes=1 << 20, timeout_ms=1000)
-//! for ev in ep.poll_events(): ...   # {"type": "failed"|"joined", "peer": (...), "ts_ns": ...}
+//! for ev in ep.poll_events(): ...   # {"type": "failed"|"joined"|"am", "peer": (...), "ts_ns": ...}
 //! ```
 //!
 //! Peers are tuples (model, stage, shard, replica). Blocking calls hold the
@@ -78,7 +78,7 @@ impl PyEndpoint {
     fn set_heartbeat(&mut self, interval_ms: u64, timeout_ms: Option<u64>) {
         self.ep.set_heartbeat((interval_ms > 0).then(|| Heartbeat {
             interval: Duration::from_millis(interval_ms),
-            timeout: Duration::from_millis(timeout_ms.unwrap_or(interval_ms * 6)),
+            timeout: Duration::from_millis(timeout_ms.unwrap_or(interval_ms.saturating_mul(6))),
         }));
     }
 
@@ -215,6 +215,7 @@ impl PyEndpoint {
         d.set_item("heartbeat_failures", s.heartbeat_failures)?;
         d.set_item("crossed_connects", s.crossed_connects)?;
         d.set_item("dropped_events", s.dropped_events)?;
+        d.set_item("cancel_deferred", s.cancel_deferred)?;
         Ok(d)
     }
 }
@@ -342,7 +343,9 @@ impl PyEngine {
         cfg.spin = Duration::from_micros(spin_us);
         cfg.heartbeat = (heartbeat_ms > 0).then(|| Heartbeat {
             interval: Duration::from_millis(heartbeat_ms),
-            timeout: Duration::from_millis(heartbeat_timeout_ms.unwrap_or(heartbeat_ms * 3)),
+            timeout: Duration::from_millis(
+                heartbeat_timeout_ms.unwrap_or(heartbeat_ms.saturating_mul(3)),
+            ),
         });
         let e = py.allow_threads(|| Engine::start(cfg)).map_err(to_py)?;
         Ok(PyEngine { e: Arc::new(e) })
@@ -400,7 +403,7 @@ impl PyEngine {
 
     /// One-sided read of `length` bytes at `src_ptr` in the peer at
     /// `remote_url` into local `dst_ptr`. Returns 0, or < 0 on failure
-    /// (-2 peer failed, -3 timeout, -4 invalid, -1 other).
+    /// (-2 peer failed, -3 timeout, -4 invalid, -5 canceled, -1 other).
     #[pyo3(signature = (remote_url, dst_ptr, src_ptr, length, timeout_ms=None))]
     fn transfer_sync_read(
         &self,
@@ -593,7 +596,8 @@ impl PyEngine {
         py.allow_threads(move || e.send_msg(t, data)).map_err(to_py)
     }
 
-    /// Next message as (peer tuple, bytes), or None after `timeout_ms`.
+    /// Next message as (peer tuple, bytes), or None after `timeout_ms` (or
+    /// once the engine is closed).
     #[pyo3(signature = (timeout_ms=None))]
     fn recv_msg<'py>(
         &self,
@@ -617,7 +621,7 @@ impl PyEngine {
             .map_err(to_py)
     }
 
-    /// Next peer event dict ({"type": "joined"|"failed", "peer", ...}) or
+    /// Next peer event dict ({"type": "up"|"joined"|"failed", "peer", ...}) or
     /// None after `timeout_ms` (or once the engine is closed).
     #[pyo3(signature = (timeout_ms=None))]
     fn wait_event<'py>(
@@ -644,6 +648,9 @@ impl PyEngine {
         d.set_item("heartbeat_failures", s.ep.heartbeat_failures)?;
         d.set_item("crossed_connects", s.ep.crossed_connects)?;
         d.set_item("dropped_events", s.ep.dropped_events)?;
+        d.set_item("closes_pending", s.ep.closes_pending)?;
+        d.set_item("anon_eps", s.ep.anon_eps)?;
+        d.set_item("cancel_deferred", s.ep.cancel_deferred)?;
         d.set_item("regions", s.regions)?;
         d.set_item("region_bytes", s.region_bytes)?;
         d.set_item("remote_rkeys", s.remote_rkeys)?;

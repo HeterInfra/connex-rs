@@ -28,6 +28,45 @@
   spin even if UCX could still write the buffer). `Stats.cancel_deferred`
   counts them.
 - Python: `Engine.put_chain(..., cancel=0, arm_timeout_ms=None)`.
+- An RMA or `put_chain` whose address range wraps around the address
+  space (`addr + len` overflows) is rejected with an invalid-argument error.
+  It used to pass the region lookup (the end wrapped to inside the region)
+  and was posted with a huge length; over TCP the serving peer segfaulted.
+- The CUDA driver is looked up again (at most every 100 ms) until found,
+  under a lock. It was looked up once per process: an engine created before
+  CUDA was initialised (Python: `connex_rs.Engine` before `torch.cuda`)
+  left that and every later engine without CUDA support, so GPU memory was
+  registered as host memory (no GPUDirect, `cuMemGetAddressRange` errors,
+  and the small-GPU-RMA check above did not apply).
+- `cx_forget_ep` walked the event ring with a 64-bit index against the
+  32-bit head/tail counters; after 2^32 events it never terminated.
+- `Engine.recv_msg(None)` returns None once the engine is closed (it waited
+  forever). `wait_event` / `recv_msg` waiters are woken under their locks at
+  shutdown, so none can miss it.
+- At shutdown endpoints are force-closed before callers are told their
+  operations were canceled, so no RDMA can land in buffers they then free.
+- The command eventfd is closed when the last reference to the engine's
+  shared state goes away, not in `shutdown`: a command racing `shutdown`
+  could write to a reused descriptor.
+- An unregister waits for this engine's own in-flight RMA from or into the
+  region before unmapping it.
+- Timeouts too large for `Instant` (e.g. `Duration::MAX`) mean "no
+  deadline" instead of panicking.
+- `Endpoint::listen` a second time fails (it replaced and leaked the first
+  listener, which kept accepting); a listener whose address query fails is
+  destroyed. `Endpoint::connect` validates the address before it drops the
+  current link to the peer. The shim checks its event ring allocation.
+- `CONNEX_RS_DEBUG` is read once, not on every event.
+- Python: `stats()` reports `cancel_deferred` (both classes) and
+  `closes_pending` / `anon_eps` (Engine); heartbeat defaults no longer
+  overflow for huge intervals; docstrings list the `up` event and the -5
+  (canceled) return code.
+- Tests: the put_chain deadline test wires up before its 300 ms chains (it
+  failed on rc_mlx5 when run with the other tests); the UCX environment is
+  set once (concurrent `setenv` / `getenv` is a data race); CI runs clippy
+  without features too; `rust-version = "1.82"`.
+- README: heartbeat is off unless configured, crossed connects converge on
+  the lower id's connection, return code -5, the GPU RMA size limit.
 
 ## 0.1.4
 

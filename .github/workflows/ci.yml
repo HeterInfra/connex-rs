@@ -35,8 +35,10 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: cargo fmt
         run: cargo fmt --check
-      - name: cargo clippy
+      - name: cargo clippy (python feature)
         run: cargo clippy --release --all-targets --all-features -- -D warnings
+      - name: cargo clippy (no features)
+        run: cargo clippy --release --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --release
 

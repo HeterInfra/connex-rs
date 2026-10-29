@@ -44,8 +44,9 @@ What it provides:
   anyone else restarting.
 * **Peer-failure events.** Every UCX endpoint runs with peer error handling;
   a dead process is reported in a few ms (its kernel tears the connection
-  down). A heartbeat on the progress thread (default 1 s / 3 s) and per-op
-  timeouts report hung or unreachable peers; those are suspicions that
+  down). A heartbeat on the progress thread (off unless `heartbeat_ms` is
+  set; the timeout defaults to 3x the interval) and per-op timeouts report
+  hung or unreachable peers; those are suspicions that
   `connex.pp` confirms with a probe.
 * **A dedicated progress thread.** It owns the UCX worker; callers submit
   commands and wait on completions, and the Python binding releases the GIL
@@ -113,6 +114,7 @@ flight, 0.92 s at 4) even though the per-run medians are far lower.
 | `python/rma_bench.py` | one-sided read latency/bandwidth, host or GPU, local or cross-host |
 | `python/churn_peer.py` | kill/rejoin a peer under the same id N times against a live engine (leak check) |
 | `python/test_binding.py` | step-1 binding smoke test |
+| `python/test_crossed.py` | simultaneous connects between two endpoints converge on one link |
 | `bench/` | failure-detection benchmarks (detection latency, rejoin, false positives) |
 | `scripts/check_release.py` | release scanner (environment-specific data, secrets), run in CI |
 | `docs/assets/` | README images (SVG) |
@@ -159,7 +161,9 @@ e.close()
 
 Return codes of `transfer_sync_read` / `transfer_sync_write`: 0 ok, -2 peer
 failed, -3 timeout (the connection is then closed, so no late DMA lands in
-the destination), -4 invalid (e.g. no registered region at that address).
+the destination), -4 invalid (e.g. no registered region at that address, or
+a GPU transfer below `UCX_ZCOPY_THRESH`), -5 canceled (engine closed), -1
+other UCX error.
 
 ## UCX settings that matter
 
@@ -185,8 +189,12 @@ the destination), -4 invalid (e.g. no registered region at that address).
 * Without RDMA (TCP), GPU memory is staged through host memory by UCX and is
   slow; host memory over TCP works as a fallback.
 * One endpoint per peer pair: if two peers connect to each other at the same
-  moment, one endpoint replaces the other (the rejoin path). `connex.pp`
-  avoids this by linking only towards peers ordered after itself.
+  moment, both keep the connection opened by the lower logical id (no extra
+  message exchange). `connex.pp` still links only towards peers ordered after
+  itself, which avoids the case altogether.
+* RMA from or into registered GPU memory must be at least
+  `UCX_ZCOPY_THRESH` bytes (4096 unless set); smaller transfers fail with
+  -4 instead of crashing in UCX's CPU-copy protocols.
 
 Measurements: [`docs/results.md`](https://github.com/HeterInfra/connex/blob/main/docs/results.md), section 6, in the Connex repository.
 
