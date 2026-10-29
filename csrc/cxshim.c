@@ -20,6 +20,7 @@
 #include <time.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include <pthread.h>
 
 #define CX_AM_HELLO 1
 #define CX_AM_HB 2
@@ -168,42 +169,62 @@ void cx_free(void *p) { free(p); }
 typedef int (*cu_ctx_get_t)(void **);
 typedef int (*cu_ctx_set_t)(void *);
 typedef int (*cu_ptr_attr_t)(void *, int, unsigned long long);
-static cu_ctx_get_t cu_get;
-static cu_ctx_set_t cu_set;
-static cu_ptr_attr_t cu_ptr_attr;
-static int cu_tried;
+typedef struct {
+    cu_ctx_get_t get;
+    cu_ctx_set_t set;
+    cu_ptr_attr_t ptr_attr;
+} cu_fns_t;
+static cu_fns_t cu_fns;
+static int cu_loaded;          // cu_fns valid (set once, under cu_lock)
+static uint64_t cu_next_try;   // next dlopen attempt while not loaded (ns)
+static pthread_mutex_t cu_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void cu_load(void) {
-    if (cu_tried) return;
-    cu_tried = 1;
-    void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
-    if (!h) return;  // CUDA not in use by this process
-    cu_get = (cu_ctx_get_t)dlsym(h, "cuCtxGetCurrent");
-    cu_set = (cu_ctx_set_t)dlsym(h, "cuCtxSetCurrent");
-    cu_ptr_attr = (cu_ptr_attr_t)dlsym(h, "cuPointerGetAttribute");
+// Called from the caller's threads and the progress thread. libcuda is
+// looked up again (at most every 100 ms) until it is found: an application
+// often initialises CUDA after it created its engine (Python: the engine
+// first, torch.cuda later). A lookup done once and never again left every
+// later engine of the process without CUDA support (GPU memory registered
+// as host memory, which also defeats the small-GPU-RMA check).
+static const cu_fns_t *cu_load(void) {
+    if (__atomic_load_n(&cu_loaded, __ATOMIC_ACQUIRE)) return &cu_fns;
+    pthread_mutex_lock(&cu_lock);
+    uint64_t now = now_ns();
+    if (!cu_loaded && now >= cu_next_try) {
+        cu_next_try = now + 100000000ull;
+        void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+        if (h) {
+            cu_fns.get = (cu_ctx_get_t)dlsym(h, "cuCtxGetCurrent");
+            cu_fns.set = (cu_ctx_set_t)dlsym(h, "cuCtxSetCurrent");
+            cu_fns.ptr_attr = (cu_ptr_attr_t)dlsym(h, "cuPointerGetAttribute");
+            __atomic_store_n(&cu_loaded, 1, __ATOMIC_RELEASE);
+        }
+    }
+    int ok = cu_loaded;
+    pthread_mutex_unlock(&cu_lock);
+    return ok ? &cu_fns : NULL;
 }
 
 // 1 when addr is CUDA device memory (CU_POINTER_ATTRIBUTE_MEMORY_TYPE ==
 // CU_MEMORYTYPE_DEVICE), else 0.
 static int cu_is_device(void *addr) {
-    cu_load();
-    if (!cu_ptr_attr) return 0;
+    const cu_fns_t *f = cu_load();
+    if (!f || !f->ptr_attr) return 0;
     unsigned int t = 0;
-    if (cu_ptr_attr(&t, 2 /* MEMORY_TYPE */, (unsigned long long)(uintptr_t)addr) != 0) return 0;
+    if (f->ptr_attr(&t, 2 /* MEMORY_TYPE */, (unsigned long long)(uintptr_t)addr) != 0) return 0;
     return t == 2 /* DEVICE */;
 }
 
 void *cx_cuda_ctx_current(void) {
-    cu_load();
+    const cu_fns_t *f = cu_load();
     void *c = NULL;
-    if (cu_get && cu_get(&c) != 0) c = NULL;
+    if (f && f->get && f->get(&c) != 0) c = NULL;
     return c;
 }
 
 int cx_cuda_ctx_set(void *ctx) {
-    cu_load();
-    if (!cu_set || !ctx) return -1;
-    return cu_set(ctx);
+    const cu_fns_t *f = cu_load();
+    if (!f || !f->set || !ctx) return -1;
+    return f->set(ctx);
 }
 
 // RDMA usable: an IB device exists and neither UCX_TLS nor UCX_NET_DEVICES
@@ -234,7 +255,9 @@ int cx_create(cx_ctx_t **out) {
     if (!c) return UCS_ERR_NO_MEMORY;
     c->ring = calloc(CX_EVQ, sizeof(cx_event_t));
     ucp_config_t *cfg;
-    ucs_status_t st = ucp_config_read(NULL, NULL, &cfg);
+    ucs_status_t st = UCS_ERR_NO_MEMORY;
+    if (!c->ring) goto fail;
+    st = ucp_config_read(NULL, NULL, &cfg);
     if (st != UCS_OK) goto fail;
     // Protocol choice (unless UCX_PROTO_ENABLE is set): v2 in HPC-X 1.16
     // selects software emulation (host staging, < 1 GB/s) for get/put on
@@ -333,7 +356,9 @@ int cx_poll_event(cx_ctx_t *c, cx_event_t *out) {
 // the next one it creates (an accepted reconnect, typically): an error or
 // message of the old endpoint still queued would be taken for the new one.
 void cx_forget_ep(cx_ctx_t *c, void *ep) {
-    for (uint64_t i = c->head; i != c->tail; i++) {
+    // uint32_t like head/tail: a wider index would never meet tail once
+    // the 32-bit counters wrap (an endless loop after 2^32 events).
+    for (uint32_t i = c->head; i != c->tail; i++) {
         cx_event_t *e = &c->ring[i % CX_EVQ];
         if (e->ep == ep) {
             free(e->payload);
@@ -364,6 +389,7 @@ static int fill_sockaddr(const char *ip, uint16_t port, struct sockaddr_in *sa) 
 // Returns the bound port (>0) or a negative ucs_status_t.
 int cx_listen(cx_ctx_t *c, const char *ip, uint16_t port) {
     struct sockaddr_in sa;
+    if (c->listener) return UCS_ERR_ALREADY_EXISTS;  // one listener per context
     if (fill_sockaddr(ip, port, &sa)) return UCS_ERR_INVALID_ADDR;
     ucp_listener_params_t lp;
     memset(&lp, 0, sizeof(lp));
@@ -377,7 +403,11 @@ int cx_listen(cx_ctx_t *c, const char *ip, uint16_t port) {
     ucp_listener_attr_t la;
     la.field_mask = UCP_LISTENER_ATTR_FIELD_SOCKADDR;
     st = ucp_listener_query(c->listener, &la);
-    if (st != UCS_OK) return st;
+    if (st != UCS_OK) {
+        ucp_listener_destroy(c->listener);
+        c->listener = NULL;
+        return st;
+    }
     return ntohs(((struct sockaddr_in *)&la.sockaddr)->sin_port);
 }
 
@@ -549,8 +579,8 @@ void *cx_tag_recv(cx_ctx_t *c, void *buf, size_t len, uint64_t tag, uint64_t mas
     return r;
 }
 
-// Returns UCS_INPROGRESS (1? no: negative) while pending, UCS_OK or an error
-// once done. For receives, *len_out gets the received length.
+// Returns UCS_INPROGRESS while pending, UCS_OK or a (negative) error once
+// done. For receives, *len_out gets the received length.
 int cx_req_test(void *req, int is_recv, size_t *len_out) {
     if (is_recv) {
         ucp_tag_recv_info_t info;
@@ -563,6 +593,19 @@ int cx_req_test(void *req, int is_recv, size_t *len_out) {
 
 void cx_req_cancel(cx_ctx_t *c, void *req) { ucp_request_cancel(c->worker, req); }
 void cx_req_free(void *req) { ucp_request_free(req); }
+
+// Test hooks: place the event ring counters at `pos` and queue a dummy
+// event for `ep` (exercises the 32-bit wrap of head/tail).
+void cx_test_ring_at(cx_ctx_t *c, uint32_t pos) { c->head = c->tail = pos; }
+int cx_test_push(cx_ctx_t *c, void *ep) {
+    cx_event_t *e = push_event(c);
+    if (!e) return -1;
+    e->type = CX_EV_HB;
+    e->ep = ep;
+    e->len = 1;
+    e->data[0] = 'R';
+    return 0;
+}
 
 int cx_inprogress(void) { return UCS_INPROGRESS; }
 int cx_err_canceled(void) { return UCS_ERR_CANCELED; }

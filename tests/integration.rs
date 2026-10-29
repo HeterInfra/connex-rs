@@ -9,10 +9,15 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Sets the UCX environment once: tests run on parallel threads, and a
+/// `setenv` while another test's UCX calls `getenv` is a data race.
 fn setup() -> String {
-    let tls = std::env::var("CONNEX_RS_TEST_TLS").unwrap_or_else(|_| "tcp".into());
-    std::env::set_var("UCX_TLS", tls);
-    std::env::set_var("UCX_WARN_UNUSED_ENV_VARS", "n");
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| {
+        let tls = std::env::var("CONNEX_RS_TEST_TLS").unwrap_or_else(|_| "tcp".into());
+        std::env::set_var("UCX_TLS", tls);
+        std::env::set_var("UCX_WARN_UNUSED_ENV_VARS", "n");
+    });
     std::env::var("CONNEX_RS_TEST_IP").unwrap_or_else(|_| "127.0.0.1".into())
 }
 
@@ -309,4 +314,40 @@ fn sigkill_detect_and_rejoin_processes() {
         assert!(c.contains("\"false_positives\":0"), "{c}");
     }
     assert!(text.contains("\"type\":\"done\""));
+}
+
+/// A second listen on one endpoint used to replace (and leak) the first
+/// listener, which kept accepting.
+#[test]
+fn second_listen_is_rejected() {
+    let ip = setup();
+    let mut ep = Endpoint::new(id(7, 0)).unwrap();
+    ep.listen(&ip, 0).unwrap();
+    assert!(ep.listen(&ip, 0).is_err());
+}
+
+/// A connect with a bad address fails before it drops the working link.
+#[test]
+fn bad_address_keeps_existing_link() {
+    let ip = setup();
+    let mut srv = Endpoint::new(id(8, 0)).unwrap();
+    let port = srv.listen(&ip, 0).unwrap();
+    let mut cli = Endpoint::new(id(8, 1)).unwrap();
+    cli.connect(&id(8, 0), &ip, port).unwrap();
+    let gen = cli.generation(&id(8, 0));
+    assert!(matches!(
+        cli.connect(&id(8, 0), "not-an-ip", port),
+        Err(connex_rs::Error::Invalid(_))
+    ));
+    assert!(cli.is_connected(&id(8, 0)));
+    assert_eq!(cli.generation(&id(8, 0)), gen);
+    let stop = Instant::now() + Duration::from_secs(5);
+    while !srv.is_connected(&id(8, 1)) && Instant::now() < stop {
+        srv.progress();
+        cli.progress();
+    }
+    let (_, r) = cli.send(&id(8, 0), 1, vec![1, 2, 3], T);
+    r.unwrap();
+    let (b, r) = srv.recv(&id(8, 1), 1, vec![0; 8], T);
+    assert_eq!(&b[..r.unwrap()], &[1, 2, 3]);
 }

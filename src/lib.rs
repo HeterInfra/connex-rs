@@ -100,6 +100,19 @@ pub fn cuda_ctx_set(ctx: usize) -> bool {
     ctx != 0 && unsafe { ffi::cx_cuda_ctx_set(ctx as *mut c_void) } == 0
 }
 
+/// `now + t`, or None when that is not representable (a timeout so large
+/// it means "never"; `Instant + Duration` would panic).
+pub(crate) fn deadline_in(t: Duration) -> Option<Instant> {
+    Instant::now().checked_add(t)
+}
+
+/// `CONNEX_RS_DEBUG` is set (read once: the environment lock is not taken
+/// on every event).
+pub(crate) fn debug_enabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("CONNEX_RS_DEBUG").is_some())
+}
+
 /// Monotonic clock (CLOCK_MONOTONIC, ns), the same clock event timestamps use.
 pub fn now_ns() -> u64 {
     unsafe { ffi::cx_now_ns() }
@@ -467,8 +480,13 @@ impl Endpoint {
     /// `peer` is dropped first, which makes this also the identity-aware
     /// reconnect.
     pub fn connect(&mut self, peer: &LogicalId, ip: &str, port: u16) -> Result<()> {
-        self.drop_peer(peer);
+        // Validate before dropping the current endpoint: a bad address must
+        // not cost the caller a working link.
+        if !ip.is_empty() && ip.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(Error::Invalid(format!("not an IPv4 address: {ip:?}")));
+        }
         let cip = CString::new(ip).map_err(|_| Error::Invalid(ip.into()))?;
+        self.drop_peer(peer);
         let mut ep = std::ptr::null_mut();
         let st = unsafe { ffi::cx_connect(self.ctx, cip.as_ptr(), port, &mut ep) };
         if st != 0 {
@@ -646,7 +664,7 @@ impl Endpoint {
     }
 
     fn emit(&mut self, ev: Event) {
-        if std::env::var_os("CONNEX_RS_DEBUG").is_some() {
+        if debug_enabled() {
             eprintln!("connex-rs[{}]: {:?}", self.me, ev);
         }
         if let Some(cb) = self.callback.as_mut() {
@@ -866,12 +884,12 @@ impl Endpoint {
 
     /// Progresses until an event is available or `timeout` passes.
     pub fn wait_event(&mut self, timeout: Duration) -> Option<Event> {
-        let deadline = Instant::now() + timeout;
+        let deadline = deadline_in(timeout);
         loop {
             if let Some(e) = self.poll_event() {
                 return Some(e);
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 return None;
             }
         }
@@ -1175,7 +1193,7 @@ impl Endpoint {
     /// Progresses until `op` completes or `timeout` passes (then cancels it).
     /// Returns the buffer and the transferred length.
     pub fn wait(&mut self, mut op: Op, timeout: Option<Duration>) -> (Vec<u8>, Result<usize>) {
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = timeout.and_then(deadline_in);
         loop {
             self.progress();
             if self.test(&mut op) {
@@ -1221,10 +1239,10 @@ impl Endpoint {
 
     /// Waits until `peer` is bound (hello received / connect issued).
     pub fn wait_peer(&mut self, peer: &LogicalId, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
+        let deadline = deadline_in(timeout);
         while !self.peers.contains_key(peer) {
             self.progress();
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 return false;
             }
         }
@@ -1294,6 +1312,34 @@ mod tests {
         assert!(rma_len_ok(1, 4096, 4096));
         assert!(rma_len_ok(1, 8192, 4096));
         assert!(!rma_len_ok(1, 1 << 30, u64::MAX));
+    }
+
+    /// cx_forget_ep walked the event ring with a 64-bit index against the
+    /// 32-bit head/tail: once the counters wrapped it never met `tail`.
+    #[test]
+    fn forget_ep_across_ring_counter_wrap() {
+        let mut ep = Endpoint::new(LogicalId::new("wrap", 0, 0, 0)).unwrap();
+        let ctx = ep.ctx as usize;
+        unsafe { ffi::cx_test_ring_at(ep.ctx, u32::MAX - 1) };
+        for _ in 0..4 {
+            assert_eq!(unsafe { ffi::cx_test_push(ep.ctx, 0x10 as *mut c_void) }, 0);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            unsafe { ffi::cx_forget_ep(ctx as *mut ffi::CxCtx, 0x10 as *mut c_void) };
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("cx_forget_ep did not return");
+        // The forgotten events are drained as no-ops.
+        ep.progress();
+        assert!(ep.next_event().is_none());
+    }
+
+    #[test]
+    fn deadline_overflow_means_never() {
+        assert!(deadline_in(Duration::MAX).is_none());
+        assert!(deadline_in(Duration::from_secs(1)).is_some());
     }
 
     #[test]
