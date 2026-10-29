@@ -42,6 +42,54 @@ pub const CORR_MASK: u64 = (1u64 << CORR_BITS) - 1;
 /// Heartbeat timeout before a peer has been heard from once.
 pub const CONNECT_GRACE_NS: u64 = 5_000_000_000;
 
+/// Progress rounds a cancel waits for UCX to complete the request before it
+/// defers the release (see [`Endpoint`]'s cancel).
+const CANCEL_SPINS: u32 = 10_000;
+
+/// Default `UCX_ZCOPY_THRESH` connex-rs runs UCX with when the variable is
+/// not set (the shim sets it on the UCX config).
+pub const DEFAULT_ZCOPY_THRESH: u64 = 4096;
+
+/// Smallest one-sided transfer allowed from or into registered GPU memory.
+///
+/// Below UCX's zero-copy threshold, RMA takes the short / bcopy protocols,
+/// which copy the local buffer with the CPU: on a GPU pointer that is a
+/// segfault in the progress thread (`uct_rc_mlx5_ep_put_short`), not an
+/// error. The threshold is `UCX_ZCOPY_THRESH` (a byte count, optionally
+/// with a k/m/g suffix) or [`DEFAULT_ZCOPY_THRESH`]; "inf" forbids GPU RMA.
+pub fn gpu_rma_min() -> u64 {
+    parse_zcopy_thresh(std::env::var("UCX_ZCOPY_THRESH").ok().as_deref())
+}
+
+fn parse_zcopy_thresh(v: Option<&str>) -> u64 {
+    let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
+        return DEFAULT_ZCOPY_THRESH;
+    };
+    if v.eq_ignore_ascii_case("inf") {
+        return u64::MAX;
+    }
+    let (num, mul) = match v.chars().last().map(|c| c.to_ascii_lowercase()) {
+        Some('k') => (&v[..v.len() - 1], 1u64 << 10),
+        Some('m') => (&v[..v.len() - 1], 1u64 << 20),
+        Some('g') => (&v[..v.len() - 1], 1u64 << 30),
+        Some('b') => (&v[..v.len() - 1], 1),
+        _ => (v, 1),
+    };
+    // "auto" and anything unparsable: UCX's default stays in force, which
+    // was not below 4 KiB in any UCX we ran; be conservative.
+    num.trim()
+        .parse::<u64>()
+        .map(|n| n.saturating_mul(mul))
+        .unwrap_or(DEFAULT_ZCOPY_THRESH)
+}
+
+/// Whether an RMA of `len` bytes from/into local memory of `mem_type`
+/// (ucs_memory_type_t: 0 host, 1 CUDA, 2 CUDA managed, ...) is safe; see
+/// [`gpu_rma_min`].
+pub fn rma_len_ok(mem_type: i32, len: u64, min: u64) -> bool {
+    !(mem_type == 1 || mem_type == 2) || len >= min
+}
+
 /// The calling thread's current CUDA context (null without CUDA).
 pub fn cuda_ctx_current() -> usize {
     unsafe { ffi::cx_cuda_ctx_current() as usize }
@@ -227,6 +275,9 @@ pub struct Stats {
     pub heartbeat_failures: u64,
     /// Simultaneous connects resolved by the tie-break (either side).
     pub crossed_connects: u64,
+    /// Canceled requests UCX had not completed when the cancel returned
+    /// (kept, with their buffers, until UCX completes them).
+    pub cancel_deferred: u64,
 }
 
 /// A pending send or receive that owns its buffer.
@@ -292,6 +343,9 @@ pub struct Endpoint {
     heartbeat: Option<Heartbeat>,
     /// Fire-and-forget AM sends with the buffers they must keep alive.
     am_pending: Vec<(*mut c_void, Vec<u8>, Vec<u8>)>,
+    /// Canceled requests UCX has not completed yet, with the buffers it may
+    /// still write (freed only once UCX is done with them).
+    canceled: Vec<(*mut c_void, bool, Option<Vec<u8>>)>,
 }
 
 /// A registered memory region ([`Endpoint::mem_map`]).
@@ -375,6 +429,7 @@ impl Endpoint {
             stats: Stats::default(),
             heartbeat: None,
             am_pending: Vec::new(),
+            canceled: Vec::new(),
         })
     }
 
@@ -781,6 +836,16 @@ impl Endpoint {
                 false
             }
         });
+        self.canceled.retain_mut(|(r, is_recv, buf)| {
+            let st = unsafe { ffi::cx_req_test(*r, *is_recv as i32, std::ptr::null_mut()) };
+            if st == inprog {
+                true
+            } else {
+                unsafe { ffi::cx_req_free(*r) };
+                drop(buf.take());
+                false
+            }
+        });
         self.hellos.retain(|&r| {
             let st = unsafe { ffi::cx_req_test(r, 0, std::ptr::null_mut()) };
             if st == inprog {
@@ -1087,16 +1152,23 @@ impl Endpoint {
             return;
         }
         unsafe { ffi::cx_req_cancel(self.ctx, op.req) };
-        // A canceled request completes on the next progress.
+        // A canceled request usually completes on the next progress.
         let inprog = unsafe { ffi::cx_inprogress() };
-        for _ in 0..1_000_000 {
+        for _ in 0..CANCEL_SPINS {
             unsafe { ffi::cx_progress(self.ctx) };
             let st = unsafe { ffi::cx_req_test(op.req, op.is_recv as i32, std::ptr::null_mut()) };
             if st != inprog {
-                break;
+                unsafe { ffi::cx_req_free(op.req) };
+                op.req = std::ptr::null_mut();
+                return;
             }
         }
-        unsafe { ffi::cx_req_free(op.req) };
+        // Not completed yet: UCX may still write the buffer (a receive being
+        // matched, an RMA in the NIC). Keep the request and the buffer alive
+        // until it completes ([`Endpoint::progress`] frees them); freeing the
+        // request now could hand the buffer back while UCX still uses it.
+        self.stats.cancel_deferred += 1;
+        self.canceled.push((op.req, op.is_recv, op.buf.take()));
         op.req = std::ptr::null_mut();
     }
 
@@ -1176,11 +1248,22 @@ impl Drop for Endpoint {
             self.close_ep(ep as *mut c_void);
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        while (!self.closing.is_empty() || !self.hellos.is_empty() || !self.am_pending.is_empty())
+        while (!self.closing.is_empty()
+            || !self.hellos.is_empty()
+            || !self.am_pending.is_empty()
+            || !self.canceled.is_empty())
             && Instant::now() < deadline
         {
             unsafe { ffi::cx_progress(self.ctx) };
             self.reap();
+        }
+        // Requests UCX never completed: their buffers are leaked, not freed
+        // (the context is gone, but a buffer handed back could still be
+        // written by a late completion during teardown).
+        for (_, _, buf) in self.canceled.drain(..) {
+            if let Some(b) = buf {
+                std::mem::forget(b);
+            }
         }
         unsafe { ffi::cx_destroy(self.ctx) };
     }
@@ -1189,6 +1272,29 @@ impl Drop for Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zcopy_threshold_parsing() {
+        assert_eq!(parse_zcopy_thresh(None), 4096);
+        assert_eq!(parse_zcopy_thresh(Some("8192")), 8192);
+        assert_eq!(parse_zcopy_thresh(Some("16k")), 16384);
+        assert_eq!(parse_zcopy_thresh(Some("1M")), 1 << 20);
+        assert_eq!(parse_zcopy_thresh(Some("inf")), u64::MAX);
+        assert_eq!(parse_zcopy_thresh(Some("auto")), 4096);
+    }
+
+    #[test]
+    fn small_gpu_rma_is_rejected() {
+        // host memory: any size
+        assert!(rma_len_ok(0, 4, 4096));
+        // CUDA memory below the zero-copy threshold would take put_short /
+        // bcopy (CPU reads of a GPU pointer: segfault)
+        assert!(!rma_len_ok(1, 2048, 4096));
+        assert!(!rma_len_ok(2, 16, 4096));
+        assert!(rma_len_ok(1, 4096, 4096));
+        assert!(rma_len_ok(1, 8192, 4096));
+        assert!(!rma_len_ok(1, 1 << 30, u64::MAX));
+    }
 
     #[test]
     fn logical_id_roundtrip() {

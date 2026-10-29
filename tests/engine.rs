@@ -186,6 +186,7 @@ fn put_chain_waits_for_doorbell_and_gate_then_flags_after_data() {
         flag_val: v,
         queue: 7,
         timeout: T,
+        ..Default::default()
     };
     for v in 1..=20u32 {
         let want = fill(&a, src, n, v as u8);
@@ -218,6 +219,90 @@ fn put_chain_waits_for_doorbell_and_gate_then_flags_after_data() {
     assert!(matches!(c1.wait(T), Some(Err(Error::Canceled))));
     assert!(matches!(c2.wait(T), Some(Err(Error::Canceled))));
     assert_eq!(word(flag).load(Ordering::Acquire), 20);
+}
+
+#[test]
+fn put_chain_cancel_word_wrap_and_deadlines() {
+    use connex_rs::engine::ChainSpec;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let ip = setup();
+    let a = engine(&ip, 0, 0);
+    let b = engine(&ip, 1, 0);
+    let n = 8192;
+    let src = a.alloc_managed(n).unwrap();
+    let dst = b.alloc_managed(n + 64).unwrap();
+    let flag = dst + n as u64;
+    let gate = flag + 4;
+    let bell = Box::new(AtomicU32::new(0));
+    let cancel = Box::new(AtomicU32::new(0));
+    let word = |p: u64| unsafe { &*(p as *const AtomicU32) };
+    let spec = |v: u32, g: Option<u32>| ChainSpec {
+        doorbell: bell.as_ref() as *const AtomicU32 as u64,
+        doorbell_val: v,
+        gate: if g.is_some() { gate } else { 0 },
+        gate_val: g.unwrap_or(0),
+        src,
+        dst,
+        len: n as u64,
+        flag,
+        flag_val: v,
+        queue: 3,
+        timeout: Some(Duration::from_millis(300)),
+        cancel: cancel.as_ref() as *const AtomicU32 as u64,
+        arm_timeout: Some(Duration::from_millis(300)),
+    };
+    // Counters wrap: u32::MAX - 1, u32::MAX, 0, 1 are reached in order
+    // (cyclic comparison, like CU_STREAM_WAIT_VALUE_GEQ).
+    bell.store(u32::MAX - 2, Ordering::Release);
+    for v in [u32::MAX - 1, u32::MAX, 0, 1, 2] {
+        let c = a.put_chain(b.local_url(), spec(v, None)).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(!c.is_done(), "chain {v} ran before its doorbell");
+        bell.store(v, Ordering::Release);
+        c.wait(T).unwrap().unwrap();
+        assert_eq!(word(flag).load(Ordering::Acquire), v);
+    }
+    // With a cancel word the doorbell value 0x7FFFFFFF is an ordinary value
+    // (a counter passes it), and a nonzero cancel word drops waiting chains
+    // even when a late doorbell write landed after the cancel.
+    bell.store(0x7FFF_FFFE, Ordering::Release);
+    let c = a.put_chain(b.local_url(), spec(0x7FFF_FFFF, None)).unwrap();
+    bell.store(0x7FFF_FFFF, Ordering::Release);
+    c.wait(T).unwrap().unwrap();
+    let c1 = a.put_chain(b.local_url(), spec(0x8000_0001, None)).unwrap();
+    let c2 = a.put_chain(b.local_url(), spec(0x8000_0002, None)).unwrap();
+    cancel.store(1, Ordering::Release);
+    bell.store(0x8000_0002, Ordering::Release); // a late stream write
+    assert!(matches!(c1.wait(T), Some(Err(Error::Canceled))));
+    assert!(matches!(c2.wait(T), Some(Err(Error::Canceled))));
+    assert_eq!(word(flag).load(Ordering::Acquire), 0x7FFF_FFFF);
+    cancel.store(0, Ordering::Release);
+    // A doorbell that never comes times out (arm_timeout) instead of
+    // holding its queue forever.
+    let t0 = Instant::now();
+    let c = a.put_chain(b.local_url(), spec(0x9000_0000, None)).unwrap();
+    assert!(matches!(c.wait(T), Some(Err(Error::Timeout))));
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    // A gate that never opens times out too (polled with backoff).
+    word(gate).store(0, Ordering::Release);
+    bell.store(0x9000_0001, Ordering::Release);
+    let t0 = Instant::now();
+    let c = a
+        .put_chain(b.local_url(), spec(0x9000_0001, Some(5)))
+        .unwrap();
+    assert!(matches!(c.wait(T), Some(Err(Error::Timeout))));
+    let dt = t0.elapsed();
+    assert!(
+        dt >= Duration::from_millis(250) && dt < Duration::from_secs(2),
+        "{dt:?}"
+    );
+    // ... and the queue goes on afterwards
+    word(gate).store(6, Ordering::Release);
+    let c = a
+        .put_chain(b.local_url(), spec(0x9000_0001, Some(5)))
+        .unwrap();
+    c.wait(T).unwrap().unwrap();
+    assert_eq!(word(flag).load(Ordering::Acquire), 0x9000_0001);
 }
 
 #[test]

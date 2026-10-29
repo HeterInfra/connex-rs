@@ -244,6 +244,11 @@ int cx_create(cx_ctx_t **out) {
     // through cuda_copy. So: v1 when RDMA can be used, else v2.
     if (!getenv("UCX_PROTO_ENABLE") && cx_rdma_usable())
         ucp_config_modify(cfg, "PROTO_ENABLE", "n");
+    // RMA from or into GPU memory below the zero-copy threshold takes the
+    // short / bcopy protocols, which copy with the CPU (a segfault on a GPU
+    // pointer). Pin the threshold so connex-rs knows it (gpu_rma_min) and
+    // rejects such transfers instead.
+    if (!getenv("UCX_ZCOPY_THRESH")) ucp_config_modify(cfg, "ZCOPY_THRESH", "4096");
     ucp_params_t p;
     memset(&p, 0, sizeof(p));
     p.field_mask = UCP_PARAM_FIELD_FEATURES;

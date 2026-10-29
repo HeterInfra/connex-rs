@@ -538,9 +538,16 @@ impl PyEngine {
     /// `doorbell` reaches `doorbell_val` and the peer's u32 at `gate`
     /// reaches `gate_val`, put `length` bytes src -> dst, then (remotely
     /// complete) the u32 `flag_val` to the peer's `flag`. Runs on the
-    /// progress thread; chains of one `queue` run in order.
+    /// progress thread; chains of one `queue` run in order. Comparisons are
+    /// cyclic (counters may wrap). `cancel`: address of a local u32 that
+    /// cancels the chain when nonzero (write it from the CPU only); without
+    /// it the value 0x7FFFFFFF in the doorbell or gate cancels.
+    /// `arm_timeout_ms` bounds the doorbell wait, `timeout_ms` each RMA and
+    /// the gate wait. A put from GPU memory smaller than UCX_ZCOPY_THRESH
+    /// (4096 by default) fails with an error instead of crashing in UCX.
     #[pyo3(signature = (remote_url, doorbell, doorbell_val, gate, gate_val, src_ptr, dst_ptr,
-                        length, flag, flag_val, queue=0, timeout_ms=None))]
+                        length, flag, flag_val, queue=0, timeout_ms=None, cancel=0,
+                        arm_timeout_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn put_chain(
         &self,
@@ -556,6 +563,8 @@ impl PyEngine {
         flag_val: u32,
         queue: u64,
         timeout_ms: Option<u64>,
+        cancel: u64,
+        arm_timeout_ms: Option<u64>,
     ) -> PyResult<PyTransfer> {
         let spec = crate::engine::ChainSpec {
             doorbell,
@@ -569,6 +578,8 @@ impl PyEngine {
             flag_val,
             queue,
             timeout: ms(timeout_ms),
+            cancel,
+            arm_timeout: ms(arm_timeout_ms),
         };
         let c = self.e.put_chain(remote_url, spec).map_err(to_py)?;
         Ok(PyTransfer { c })

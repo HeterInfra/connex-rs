@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased (0.1.5)
+
+- RMA from or into registered GPU memory below UCX's zero-copy threshold is
+  rejected with an error instead of crashing. Below that threshold UCX takes
+  the short / bcopy protocols, which copy the buffer with the CPU: a 2 KB
+  put from GPU memory segfaulted in `uct_rc_mlx5_ep_put_short` /
+  `put_bcopy` (HPC-X 2.18, rc_mlx5), also inside `put_chain`. The threshold
+  is `UCX_ZCOPY_THRESH`; connex-rs now sets it to 4096 on its UCX config
+  when the variable is unset, so the limit is known (`gpu_rma_min()`). The
+  0.1.4 "known limit" note is replaced by this check.
+- `put_chain`: a `cancel` word (a local u32 only the CPU writes; nonzero
+  cancels the chain while it waits for its doorbell or gate). The 0.1.4
+  cancel value 0x7FFFFFFF in the doorbell could be overwritten by a stream
+  write that was still queued; without a cancel word the old behaviour
+  stays. Doorbell and gate comparisons are now cyclic (`(int32)(word - val)
+  >= 0`, as `CU_STREAM_WAIT_VALUE_GEQ`), so counters may wrap past 2^32 and
+  pass 0x7FFFFFFF.
+- `put_chain` deadlines: `arm_timeout` bounds the doorbell wait (default
+  none), and the whole gate wait is bounded by `timeout` (it polled
+  forever). A gate that is not open is read again after a growing pause
+  (2 µs doubling to 200 µs) instead of back to back, and the progress
+  thread's poll interval while chains are armed grows with the idle time
+  (5 µs, then 10 µs after 1 ms, 20 µs after 5 ms) instead of 5 µs forever.
+- A cancelled request that UCX has not completed after the cancel is kept,
+  with its buffer, until UCX completes it (it was freed after a bounded
+  spin even if UCX could still write the buffer). `Stats.cancel_deferred`
+  counts them.
+- Python: `Engine.put_chain(..., cancel=0, arm_timeout_ms=None)`.
+
 ## 0.1.4
 
 - `Engine.put_chain` (Rust and Python): an armed put that the progress

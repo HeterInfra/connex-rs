@@ -658,15 +658,27 @@ struct Inflight {
 
 /// A put chain: the progress thread waits until the u32 at the local
 /// `doorbell` address reaches `doorbell_val` (typically written by a GPU
-/// stream with `cuStreamWriteValue32`; 0x7FFFFFFF cancels), then until the
-/// u32 at the peer's `gate` address reaches `gate_val` (polled with
-/// one-sided reads), then puts `len` bytes from local `src` to the peer's
-/// `dst`, reads its last word back (so the data is in the peer's memory
-/// even where a GPU does not order RDMA writes), then puts the u32 `flag_val`
-/// to the peer's `flag` address. The peer can therefore wait for `flag`
-/// (e.g. `cuStreamWaitValue32` on host memory) and then use the data,
+/// stream with `cuStreamWriteValue32`), then until the u32 at the peer's
+/// `gate` address reaches `gate_val` (polled with one-sided reads, backing
+/// off while it does not), then puts `len` bytes from local `src` to the
+/// peer's `dst`, reads its last word back (so the data is in the peer's
+/// memory even where a GPU does not order RDMA writes), then puts the u32
+/// `flag_val` to the peer's `flag` address. The peer can therefore wait for
+/// `flag` (e.g. `cuStreamWaitValue32` on host memory) and then use the data,
 /// with no thread of either side's application on the path. Chains with
 /// the same `queue` run strictly in order. Zero addresses skip a step.
+///
+/// "Reaches" is a cyclic comparison, `(int32)(word - val) >= 0`, the same
+/// as `CU_STREAM_WAIT_VALUE_GEQ`, so counters may wrap around 2^32.
+///
+/// Cancel: with a `cancel` address, a nonzero u32 there cancels the chain
+/// while it waits for the doorbell or the gate. Only the application's CPU
+/// should write that word: a doorbell value can be overwritten by a stream
+/// write that was still queued. Without one (0.1.4 behaviour), the value
+/// 0x7FFFFFFF in the doorbell or the gate cancels.
+///
+/// Deadlines: `arm_timeout` bounds the doorbell wait (None: forever);
+/// `timeout` bounds each RMA and the whole gate wait.
 #[derive(Clone, Debug, Default)]
 pub struct ChainSpec {
     pub doorbell: u64,
@@ -679,9 +691,36 @@ pub struct ChainSpec {
     pub flag: u64,
     pub flag_val: u32,
     pub queue: u64,
-    /// Deadline of each RMA of the chain (not of the doorbell wait).
+    /// Deadline of each RMA of the chain and of the gate wait.
     pub timeout: Option<Duration>,
+    /// Local u32 that cancels the chain when nonzero (0: none, see above).
+    pub cancel: u64,
+    /// Deadline of the doorbell wait (None: forever).
+    pub arm_timeout: Option<Duration>,
 }
+
+/// Pause between two doorbell polls of the progress thread after `idle`
+/// without work.
+fn chain_poll_pause(idle: Duration) -> Duration {
+    if idle < Duration::from_millis(1) {
+        Duration::from_micros(5)
+    } else if idle < Duration::from_millis(5) {
+        Duration::from_micros(10)
+    } else {
+        Duration::from_micros(20)
+    }
+}
+
+/// `word` has reached `val` in the cyclic order of u32 counters.
+#[inline]
+pub fn reached(word: u32, val: u32) -> bool {
+    (word.wrapping_sub(val) as i32) >= 0
+}
+
+/// Gate polls back off from this ...
+const GATE_POLL_MIN: Duration = Duration::from_micros(2);
+/// ... up to this between two one-sided reads of a gate that is not open.
+const GATE_POLL_MAX: Duration = Duration::from_micros(200);
 
 const CANCEL: u32 = 0x7FFF_FFFF;
 
@@ -693,6 +732,23 @@ struct Chain {
     /// Gate read destination and flag put source (host, unregistered).
     scratch: Box<[u32; 2]>,
     done: Arc<Completion>,
+    /// When the chain was armed / started waiting for the gate.
+    armed: Instant,
+    gate_since: Option<Instant>,
+    /// Next gate read not before this; current backoff.
+    gate_next: Instant,
+    gate_backoff: Duration,
+}
+
+impl Chain {
+    fn canceled(&self, word: u32) -> bool {
+        if self.spec.cancel != 0 {
+            let c = unsafe { std::ptr::read_volatile(self.spec.cancel as *const u32) };
+            c != 0
+        } else {
+            word == CANCEL
+        }
+    }
 }
 
 struct PendingUnreg {
@@ -722,6 +778,8 @@ struct State {
     up: HashSet<LogicalId>,
     cuda_ctx: usize,
     stats: EngineStats,
+    /// Smallest RMA allowed on registered GPU memory (crate::gpu_rma_min).
+    gpu_rma_min: u64,
 }
 
 fn rd64(b: &[u8], off: usize) -> u64 {
@@ -784,6 +842,7 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         up: HashSet::new(),
         cuda_ctx,
         stats: EngineStats::default(),
+        gpu_rma_min: crate::gpu_rma_min(),
     };
     let spin = cfg.spin;
     let hb_tick = cfg
@@ -804,9 +863,13 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         }
         if !st.chains.is_empty() {
             // Armed chains poll their doorbells: no long sleep (the timer
-            // slack of this thread is 1 µs, so this is about 5-10 µs).
-            if last_work.elapsed() >= spin {
-                std::thread::sleep(Duration::from_micros(5));
+            // slack of this thread is 1 µs). The pause grows with the idle
+            // time, so a chain that waits long (a slow step upstream, a gate
+            // that stays closed) costs little CPU, while back-to-back steps
+            // keep a doorbell-to-put latency of a few µs.
+            let idle = last_work.elapsed();
+            if idle >= spin {
+                std::thread::sleep(chain_poll_pause(idle));
             } else {
                 std::hint::spin_loop();
             }
@@ -1030,6 +1093,10 @@ impl State {
                     cur: None,
                     scratch: Box::new([0, 0]),
                     done,
+                    armed: Instant::now(),
+                    gate_since: None,
+                    gate_next: Instant::now(),
+                    gate_backoff: GATE_POLL_MIN,
                 });
             }
             Cmd::Msg { to, data, done } => {
@@ -1100,13 +1167,15 @@ impl State {
             .map(|r| (r.base, r.rkey.clone()))
     }
 
-    fn local_memh(&self, addr: u64, len: u64) -> *mut std::ffi::c_void {
+    /// Memory handle and ucs memory type of the registered region holding
+    /// `addr..addr+len` (null, -1 when unregistered).
+    fn local_memh(&self, addr: u64, len: u64) -> (*mut std::ffi::c_void, i32) {
         if let Some((_, r)) = self.local.range(..=addr).next_back() {
             if addr + len <= r.region.addr + r.region.len {
-                return r.region.memh;
+                return (r.region.memh, r.region.mem_type);
             }
         }
-        std::ptr::null_mut()
+        (std::ptr::null_mut(), -1)
     }
 
     fn start_rma(&mut self, peer: &LogicalId, w: WaitingRma) {
@@ -1127,7 +1196,20 @@ impl State {
     }
 
     fn post_rma(&mut self, peer: &LogicalId, base: u64, rkey: Rc<Rkey>, w: WaitingRma) {
-        let memh = self.local_memh(w.local, w.len);
+        let (memh, mem_type) = self.local_memh(w.local, w.len);
+        if !crate::rma_len_ok(mem_type, w.len, self.gpu_rma_min) {
+            // UCX would copy the GPU buffer with the CPU (short / bcopy
+            // protocol below the zero-copy threshold) and crash.
+            self.stats.rma_err += 1;
+            w.done.set(Err(Error::Invalid(format!(
+                "{}-byte RMA {} GPU memory is below UCX_ZCOPY_THRESH ({}); \
+                 use at least that many bytes or stage through host memory",
+                w.len,
+                if w.is_put { "from" } else { "into" },
+                self.gpu_rma_min
+            ))));
+            return;
+        }
         let r = unsafe {
             self.ep.post_rma(
                 peer,
@@ -1327,10 +1409,14 @@ impl State {
                     if c.spec.doorbell != 0 {
                         let v = unsafe { std::ptr::read_volatile(c.spec.doorbell as *const u32) };
                         std::sync::atomic::fence(Ordering::Acquire);
-                        if v == CANCEL {
+                        if c.canceled(v) {
                             return Some(Err(Error::Canceled));
                         }
-                        if (v as i32) < (c.spec.doorbell_val as i32) {
+                        if !reached(v, c.spec.doorbell_val) {
+                            if c.spec.arm_timeout.is_some_and(|t| c.armed.elapsed() >= t) {
+                                self.stats.op_timeouts += 1;
+                                return Some(Err(Error::Timeout));
+                            }
                             return None;
                         }
                     }
@@ -1341,8 +1427,22 @@ impl State {
                         c.stage = 2;
                         continue;
                     }
+                    let now = Instant::now();
+                    let since = *c.gate_since.get_or_insert(now);
                     match &c.cur {
                         None => {
+                            if c.spec.cancel != 0 && c.canceled(0) {
+                                return Some(Err(Error::Canceled));
+                            }
+                            if now.duration_since(since)
+                                >= c.spec.timeout.unwrap_or(DEFAULT_OP_TIMEOUT)
+                            {
+                                self.stats.op_timeouts += 1;
+                                return Some(Err(Error::Timeout));
+                            }
+                            if now < c.gate_next {
+                                return None; // backing off
+                            }
                             let ptr = c.scratch.as_mut_ptr() as u64;
                             c.cur = Some(self.chain_rma(
                                 &c.peer,
@@ -1359,11 +1459,16 @@ impl State {
                             Ok(()) => {
                                 c.cur = None;
                                 let v = unsafe { std::ptr::read_volatile(c.scratch.as_ptr()) };
-                                if v == CANCEL {
+                                if c.canceled(v) {
                                     return Some(Err(Error::Canceled));
                                 }
-                                if (v as i32) < (c.spec.gate_val as i32) {
-                                    return None; // read again next round
+                                if !reached(v, c.spec.gate_val) {
+                                    // Not open: read again after a growing
+                                    // pause (back-to-back 4-byte reads only
+                                    // load the NIC and the peer's PCIe).
+                                    c.gate_next = Instant::now() + c.gate_backoff;
+                                    c.gate_backoff = (c.gate_backoff * 2).min(GATE_POLL_MAX);
+                                    return None;
                                 }
                                 c.stage = 2;
                             }
