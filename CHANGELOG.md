@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.1.5)
+## 0.1.5
 
 - RMA from or into registered GPU memory below UCX's zero-copy threshold is
   rejected with an error instead of crashing. Below that threshold UCX takes
