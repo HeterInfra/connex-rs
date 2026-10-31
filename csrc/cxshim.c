@@ -229,6 +229,17 @@ int cx_cuda_ctx_set(void *ctx) {
     return f->set(ctx);
 }
 
+// `name` is one of the comma-separated entries of `list`, or a prefix of
+// one ("rc" matches "rc_mlx5").
+static int tl_listed(const char *list, const char *name) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", list);
+    size_t n = strlen(name);
+    for (char *save = NULL, *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save))
+        if (strncmp(t, name, n) == 0) return 1;
+    return 0;
+}
+
 // RDMA usable: an IB device exists and neither UCX_TLS nor UCX_NET_DEVICES
 // rules it out (homogeneous clusters assumed: the peer has RDMA too).
 static int cx_rdma_usable(void) {
@@ -244,6 +255,11 @@ static int cx_rdma_usable(void) {
     const char *tls = getenv("UCX_TLS");
     if (tls && tls[0] != '^' && !strstr(tls, "all") && !strstr(tls, "rc") &&
         !strstr(tls, "dc") && !strstr(tls, "ib"))
+        return 0;
+    // An exclusion list that removes every IB transport ("^ib", "^rc,dc,ud").
+    if (tls && tls[0] == '^' &&
+        (tl_listed(tls + 1, "ib") ||
+         (tl_listed(tls + 1, "rc") && tl_listed(tls + 1, "dc") && tl_listed(tls + 1, "ud"))))
         return 0;
     const char *nd = getenv("UCX_NET_DEVICES");  // IB ports are "dev:port"
     if (nd && !strstr(nd, "all") && !strchr(nd, ':')) return 0;

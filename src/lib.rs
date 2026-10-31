@@ -83,6 +83,83 @@ fn parse_zcopy_thresh(v: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_ZCOPY_THRESH)
 }
 
+/// Why an endpoint listening on (or connecting to) `ip` cannot work with
+/// the configured UCX devices, if so: `UCX_NET_DEVICES` lists devices but
+/// not the interface that carries `ip` (`lo` for a loopback address). UCX's
+/// connection manager only uses listed devices: the endpoint wires up, fails
+/// with "Destination is unreachable", and every reconnect fails the same way.
+/// An interface on a listed RDMA device (IPoIB) is reached through rdmacm.
+pub fn net_devices_exclude(ip: &str) -> Option<String> {
+    let devices = std::env::var("UCX_NET_DEVICES").ok()?;
+    net_devices_exclude_with(ip, &devices, iface_of, |iface, dev| {
+        std::path::Path::new("/sys/class/net")
+            .join(iface)
+            .join("device/infiniband")
+            .join(dev)
+            .exists()
+    })
+}
+
+fn net_devices_exclude_with(
+    ip: &str,
+    devices: &str,
+    iface_of: impl Fn(std::net::Ipv4Addr) -> Option<String>,
+    on_rdma_dev: impl Fn(&str, &str) -> bool,
+) -> Option<String> {
+    let devices = devices.trim();
+    let listed: Vec<&str> = devices.split(',').map(str::trim).collect();
+    if devices.is_empty() || listed.iter().any(|d| d.eq_ignore_ascii_case("all")) {
+        return None;
+    }
+    let addr = ip
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    let iface = match addr {
+        a if a.is_loopback() => "lo".to_string(),
+        std::net::IpAddr::V4(a) if !a.is_unspecified() => iface_of(a)?,
+        _ => return None,
+    };
+    let reached = listed.contains(&iface.as_str())
+        || listed
+            .iter()
+            .filter_map(|d| d.split_once(':').map(|(dev, _)| dev))
+            .any(|dev| on_rdma_dev(&iface, dev));
+    (!reached).then(|| {
+        format!(
+            "{ip} is on interface {iface:?}, which UCX_NET_DEVICES={devices:?} does not list \
+             (add \"{iface}\", unset UCX_NET_DEVICES, or use an address on a listed interface)"
+        )
+    })
+}
+
+/// The interface that carries the IPv4 address `a`.
+fn iface_of(a: std::net::Ipv4Addr) -> Option<String> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+    let mut out = None;
+    let mut p = head;
+    while !p.is_null() {
+        let ifa = unsafe { &*p };
+        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET {
+            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            if u32::from_be(sin.sin_addr.s_addr) == u32::from(a) {
+                out = Some(
+                    unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                break;
+            }
+        }
+        p = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(head) };
+    out
+}
+
 /// Whether an RMA of `len` bytes from/into local memory of `mem_type`
 /// (ucs_memory_type_t: 0 host, 1 CUDA, 2 CUDA managed, ...) is safe; see
 /// [`gpu_rma_min`].
@@ -467,6 +544,9 @@ impl Endpoint {
 
     /// Listens on `ip:port` (port 0 = ephemeral). Returns the bound port.
     pub fn listen(&mut self, ip: &str, port: u16) -> Result<u16> {
+        if let Some(why) = net_devices_exclude(ip) {
+            return Err(Error::Invalid(why));
+        }
         let cip = CString::new(ip).map_err(|_| Error::Invalid(ip.into()))?;
         let r = unsafe { ffi::cx_listen(self.ctx, cip.as_ptr(), port) };
         if r <= 0 {
@@ -484,6 +564,16 @@ impl Endpoint {
         // not cost the caller a working link.
         if !ip.is_empty() && ip.parse::<std::net::Ipv4Addr>().is_err() {
             return Err(Error::Invalid(format!("not an IPv4 address: {ip:?}")));
+        }
+        // (A remote address is on no local interface: only a loopback
+        // target can be checked here.)
+        if ip
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|a| a.is_loopback())
+        {
+            if let Some(why) = net_devices_exclude(ip) {
+                return Err(Error::Invalid(why));
+            }
         }
         let cip = CString::new(ip).map_err(|_| Error::Invalid(ip.into()))?;
         self.drop_peer(peer);
@@ -1430,5 +1520,37 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 32);
+    }
+}
+
+#[cfg(test)]
+mod net_devices_tests {
+    fn f(ip: &str, devices: &str, own: fn(std::net::Ipv4Addr) -> Option<String>) -> Option<String> {
+        super::net_devices_exclude_with(ip, devices, own, |iface, dev| {
+            iface == "ib0" && dev == "mlx5_0"
+        })
+    }
+
+    fn own(a: std::net::Ipv4Addr) -> Option<String> {
+        if a == std::net::Ipv4Addr::new(10, 0, 0, 2) {
+            return Some("ib0".into());
+        }
+        (a == std::net::Ipv4Addr::new(10, 0, 0, 3)).then(|| "eth1".to_string())
+    }
+
+    #[test]
+    fn listen_interface_must_be_listed() {
+        assert!(f("127.0.0.1", "mlx5_0:1,ib0", own).is_some());
+        assert!(f("::1", "mlx5_0:1", own).is_some());
+        assert!(f("127.0.0.1", "mlx5_0:1,ib0,lo", own).is_none());
+        assert!(f("10.0.0.3", "mlx5_0:1,ib0", own).is_some());
+        assert!(f("10.0.0.3", "mlx5_0:1,eth1", own).is_none());
+        assert!(f("127.0.0.1", "all", own).is_none());
+        assert!(f("127.0.0.1", "", own).is_none());
+        assert!(f("10.0.0.1", "mlx5_0:1", own).is_none()); // on no local interface
+        assert!(f("10.0.0.2", "mlx5_0:1", own).is_none()); // IPoIB of a listed device
+        assert!(f("10.0.0.2", "mlx5_1:1", own).is_some());
+        assert!(f("0.0.0.0", "mlx5_0:1", own).is_none());
+        assert!(f("", "mlx5_0:1", own).is_none());
     }
 }

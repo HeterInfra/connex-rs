@@ -1712,12 +1712,19 @@ impl State {
                 }
                 FENCED => {
                     let r = c.cur.as_ref().unwrap().result()?;
+                    // Every posted op must be answered before the chain (and
+                    // the scratch words the readback / flag ops point into)
+                    // is dropped, also when a later post failed.
+                    let mut first_err = None;
                     for d in &c.fenced {
                         if let Err(e) = d.result()? {
-                            return Some(Err(e));
+                            first_err.get_or_insert(e);
                         }
                     }
-                    return Some(r);
+                    return Some(match (r, first_err) {
+                        (Ok(()), Some(e)) => Err(e),
+                        (r, _) => r,
+                    });
                 }
                 2 | 4 => {
                     let (src, dst, len) = if c.stage == 2 {

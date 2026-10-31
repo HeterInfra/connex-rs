@@ -43,6 +43,18 @@ Fixes:
   a timed-out wait, or a dropped `Op`, keeps the memory in use.
 - A failed accept is left to UCX on purpose (it already rejects and frees
   the connection request); documented at the call.
+- An address on an interface that `UCX_NET_DEVICES` does not list (for
+  example 127.0.0.1 with `UCX_NET_DEVICES=mlx5_0:1,ib0`) used to join,
+  fail with "Destination is unreachable" and fail the same way on every
+  reconnect. `listen` (and so `Engine(...)`) now refuses such an address,
+  and `connect` a loopback one, with an error that names the interface. An
+  IPoIB address of a listed RDMA device is accepted (rdmacm reaches it).
+- Fenced `put_chain`: when posting the readback or flag op failed after the
+  data put was posted, the chain completed at once and freed the scratch
+  words the posted ops still pointed into. It now waits for every posted op.
+- RDMA detection treated an exclusion list that removes every IB transport
+  (`UCX_TLS=^ib`, `^rc,dc,ud`) as RDMA, so the fenced chain path and the
+  IB-only config keys were used over TCP.
 
 Tools: `cxrma`, a data-plane microbenchmark (latency, bandwidth, put_chain,
 connect time, idle CPU, chain ordering check), host or GPU memory.

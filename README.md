@@ -129,6 +129,11 @@ bridge, and `ucx_perftest` reaches only 7.7 GB/s between GPUs attached to
 the other CPU socket. Over TCP (`UCX_TLS=tcp`, loopback) a 1 MB read went
 from 0.9 to 3.3 GB/s and a 4 KB put from 46 to 41 µs.
 
+In a full pipeline (vLLM PP=2 across two hosts, this build), the first
+`put_chain` on a freshly opened push channel completes 0.4-17 ms after the
+channel opens, and stage 0 switches to a spare replica 1-3 ms after
+connex-rs reports the active one failed.
+
 Reproduce: `cargo build --release`, then `target/release/cxrma local --ip
 <ib ip>` on one host, or `cxrma owner` on one host and `cxrma reader --url
 <url> --addr <addr>` on the other (`--gpu-owner D --gpu-reader D` for GPU
@@ -205,7 +210,12 @@ other UCX error.
 * `UCX_NET_DEVICES`: pin the RDMA device and its IPoIB interface
   (`connex.pp` does this automatically, `CONNEX_RS_NET_DEVICES=auto`). On
   hosts with container or VPN interfaces UCX otherwise tries those and the
-  connection fails. HCA names can differ between hosts.
+  connection fails. HCA names can differ between hosts. The list must also
+  name the interface that carries the listen address (`lo` for 127.0.0.1)
+  unless that is the IPoIB interface of a listed RDMA device: UCX's
+  connection manager only uses listed devices. `listen` rejects such an
+  address with an error that names the interface; earlier versions joined
+  and then failed every connect with "Destination is unreachable".
 * Protocol: when RDMA is usable the engine sets `PROTO_ENABLE=n` on its own
   UCX configuration. UCX 1.16's protocol v2 selects software emulation for
   get/put on CUDA memory over client/server endpoints, while v1 does
