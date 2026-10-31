@@ -222,13 +222,17 @@ impl Completion {
         }
     }
 
+    /// Done, or never will be: a caller that polls must also see a dead
+    /// progress thread (its `result` is then the "died" error).
     pub fn is_done(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
+        self.flag.load(Ordering::Acquire) || self.is_dead()
     }
 
     fn result(&self) -> Option<Result<()>> {
         if !self.flag.load(Ordering::Acquire) {
-            return None;
+            return self
+                .is_dead()
+                .then(|| Err(Error::Invalid("connex-rs progress thread died".into())));
         }
         self.r.get().cloned()
     }
@@ -2120,5 +2124,20 @@ impl State {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn polling_caller_sees_a_dead_progress_thread() {
+        let dead = Arc::new(AtomicBool::new(false));
+        let c = Completion::for_caller(&dead);
+        assert!(!c.is_done() && c.result().is_none());
+        dead.store(true, Ordering::SeqCst);
+        assert!(c.is_done());
+        assert!(matches!(c.result(), Some(Err(_))));
     }
 }

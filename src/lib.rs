@@ -108,7 +108,11 @@ fn net_devices_exclude_with(
 ) -> Option<String> {
     let devices = devices.trim();
     let listed: Vec<&str> = devices.split(',').map(str::trim).collect();
-    if devices.is_empty() || listed.iter().any(|d| d.eq_ignore_ascii_case("all")) {
+    // "^..." is a deny list: anything not named is usable, not checked here.
+    if devices.is_empty()
+        || devices.starts_with('^')
+        || listed.iter().any(|d| d.eq_ignore_ascii_case("all"))
+    {
         return None;
     }
     let addr = ip
@@ -117,7 +121,11 @@ fn net_devices_exclude_with(
         .ok()?;
     let iface = match addr {
         a if a.is_loopback() => "lo".to_string(),
-        std::net::IpAddr::V4(a) if !a.is_unspecified() => iface_of(a)?,
+        // An address alias ("eth0:1") belongs to the interface "eth0".
+        std::net::IpAddr::V4(a) if !a.is_unspecified() => {
+            let name = iface_of(a)?;
+            name.split(':').next().unwrap_or(&name).to_string()
+        }
         _ => return None,
     };
     let reached = listed.contains(&iface.as_str())
@@ -1002,7 +1010,9 @@ impl Endpoint {
         }
         let mut ms = 10i64;
         if let Some(hb) = self.heartbeat {
-            ms = ms.min(hb.interval.as_millis() as i64);
+            // at least 1 ms: a sub-millisecond interval must not turn this
+            // into a busy poll
+            ms = ms.min((hb.interval.as_millis() as i64).max(1));
         }
         if let Some(d) = deadline {
             let left = d.saturating_duration_since(Instant::now());
@@ -1535,6 +1545,9 @@ mod net_devices_tests {
         if a == std::net::Ipv4Addr::new(10, 0, 0, 2) {
             return Some("ib0".into());
         }
+        if a == std::net::Ipv4Addr::new(10, 0, 0, 4) {
+            return Some("eth1:1".into()); // an address alias
+        }
         (a == std::net::Ipv4Addr::new(10, 0, 0, 3)).then(|| "eth1".to_string())
     }
 
@@ -1552,5 +1565,8 @@ mod net_devices_tests {
         assert!(f("10.0.0.2", "mlx5_1:1", own).is_some());
         assert!(f("0.0.0.0", "mlx5_0:1", own).is_none());
         assert!(f("", "mlx5_0:1", own).is_none());
+        assert!(f("10.0.0.4", "mlx5_0:1,eth1", own).is_none()); // alias of a listed interface
+        assert!(f("10.0.0.4", "mlx5_0:1", own).is_some());
+        assert!(f("127.0.0.1", "^mlx5_1:1", own).is_none()); // deny list: not checked
     }
 }

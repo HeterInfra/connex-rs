@@ -32,6 +32,13 @@ Performance (numbers in the README, "Data-plane microbenchmarks"):
 
 Fixes:
 
+- `Op.is_done()` (Python) and `Completion::is_done` also report done when
+  the progress thread has died; a caller that polls instead of waiting no
+  longer loops forever, and its result is the "progress thread died" error.
+- The listen/connect check against `UCX_NET_DEVICES` accepts an address on
+  an alias (`eth0:1` belongs to `eth0`) and skips deny lists (`^...`).
+- The idle wait never drops below 1 ms (a sub-millisecond heartbeat
+  interval turned it back into a busy poll).
 - A panic on the progress thread left every caller waiting forever. It now
   fails queued commands, ends waits with an error within 100 ms and marks
   the engine shut down.
