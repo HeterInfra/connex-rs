@@ -351,3 +351,27 @@ fn bad_address_keeps_existing_link() {
     let (b, r) = srv.recv(&id(8, 1), 1, vec![0; 8], T);
     assert_eq!(&b[..r.unwrap()], &[1, 2, 3]);
 }
+
+#[test]
+fn wait_event_sleeps_instead_of_spinning() {
+    setup();
+    let mut ep = connex_rs::Endpoint::new(connex_rs::LogicalId::new("idle", 0, 0, 0)).unwrap();
+    let cpu = || {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+        let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 * 1e-6;
+        t(ru.ru_utime) + t(ru.ru_stime)
+    };
+    let c0 = cpu();
+    let t0 = std::time::Instant::now();
+    assert!(ep
+        .wait_event(std::time::Duration::from_millis(500))
+        .is_none());
+    let wall = t0.elapsed().as_secs_f64();
+    let used = cpu() - c0;
+    assert!(wall >= 0.49, "returned early: {wall}");
+    assert!(
+        used < 0.25 * wall,
+        "busy-polled: {used:.3} s CPU in {wall:.3} s"
+    );
+}

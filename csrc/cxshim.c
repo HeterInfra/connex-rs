@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -48,6 +49,7 @@ typedef struct {
     cx_event_t *ring;
     uint32_t head, tail;  // ring indices (tail = next write)
     uint64_t dropped;
+    int rdma;             // RDMA usable at creation (cx_rdma_usable)
 } cx_ctx_t;
 
 static uint64_t now_ns(void) {
@@ -248,7 +250,32 @@ static int cx_rdma_usable(void) {
     return 1;
 }
 
+// TCP likely opened: UCX_TLS allows it and UCX_NET_DEVICES names a
+// non-IB device (IB ports are "dev:port") or is unset / "all".
+static int cx_tcp_usable(void) {
+    const char *tls = getenv("UCX_TLS");
+    if (tls && tls[0] != '^' && !strstr(tls, "all") && !strstr(tls, "tcp")) return 0;
+    if (tls && tls[0] == '^' && strstr(tls, "tcp")) return 0;
+    const char *nd = getenv("UCX_NET_DEVICES");
+    if (!nd || strstr(nd, "all")) return 1;
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", nd);
+    for (char *save = NULL, *t = strtok_r(buf, ",", &save); t; t = strtok_r(NULL, ",", &save))
+        if (!strchr(t, ':')) return 1;
+    return 0;
+}
+
 // ---------------------------------------------------------------- lifecycle
+
+// An explicit UCX_<TL>_<name> setting for any of the listed transports.
+static int env_set_any(const char *const *tls, size_t n, const char *name) {
+    char k[64];
+    for (size_t i = 0; i < n; i++) {
+        snprintf(k, sizeof(k), "UCX_%s_%s", tls[i], name);
+        if (getenv(k)) return 1;
+    }
+    return 0;
+}
 
 int cx_create(cx_ctx_t **out) {
     cx_ctx_t *c = calloc(1, sizeof(*c));
@@ -265,13 +292,31 @@ int cx_create(cx_ctx_t **out) {
     // Without RDMA, though, v1 emulates RMA on CUDA memory by touching the
     // device pointer from the CPU (the owner segfaults), while v2 stages it
     // through cuda_copy. So: v1 when RDMA can be used, else v2.
-    if (!getenv("UCX_PROTO_ENABLE") && cx_rdma_usable())
+    c->rdma = cx_rdma_usable();
+    if (!getenv("UCX_PROTO_ENABLE") && c->rdma)
         ucp_config_modify(cfg, "PROTO_ENABLE", "n");
     // RMA from or into GPU memory below the zero-copy threshold takes the
     // short / bcopy protocols, which copy with the CPU (a segfault on a GPU
     // pointer). Pin the threshold so connex-rs knows it (gpu_rma_min) and
     // rejects such transfers instead.
     if (!getenv("UCX_ZCOPY_THRESH")) ucp_config_modify(cfg, "ZCOPY_THRESH", "4096");
+    // Wire-up time: the IB transports allocate their 10-40 MB receive and
+    // send buffer pools with transparent huge pages first. On a host with
+    // fragmented memory and THP defrag=madvise that is a direct compaction
+    // stall, which made an rc_mlx5 connect take 30 ms to 1.7 s (cc241).
+    // Plain pages make it a steady ~40 ms; the pools are not on the RDMA
+    // data path. ("IB_ALLOC" reaches the IB sub-table of rc/ud/dc.)
+    static const char *const ib_tls[] = {"IB", "RC", "RC_MLX5", "RC_VERBS", "DC_MLX5", "UD", "UD_MLX5", "UD_VERBS"};
+    // (Only where the transports open: UCX warns about options no
+    // transport consumed.)
+    if (c->rdma && !env_set_any(ib_tls, sizeof(ib_tls) / sizeof(ib_tls[0]), "ALLOC"))
+        ucp_config_modify(cfg, "IB_ALLOC", "mmap,heap");
+    // Over TCP, get is emulated with request/response fragments of
+    // TCP_TX_SEG_SIZE (8 KB default): 0.9 GB/s; 256 KB: 3.3 GB/s.
+    if (cx_tcp_usable() && !getenv("UCX_TCP_TX_SEG_SIZE") && !getenv("UCX_TCP_RX_SEG_SIZE")) {
+        ucp_config_modify(cfg, "TX_SEG_SIZE", "256k");
+        ucp_config_modify(cfg, "RX_SEG_SIZE", "256k");
+    }
     ucp_params_t p;
     memset(&p, 0, sizeof(p));
     p.field_mask = UCP_PARAM_FIELD_FEATURES;
@@ -550,6 +595,14 @@ void *cx_rma(void *ep, int is_put, void *local, size_t len, uint64_t raddr, void
     if (is_put) return ucp_put_nbx((ucp_ep_h)ep, local, len, raddr, (ucp_rkey_h)rkey, &p);
     return ucp_get_nbx((ucp_ep_h)ep, local, len, raddr, (ucp_rkey_h)rkey, &p);
 }
+
+// Ordering point: RMA posted after it starts only after the RMA posted
+// before it (on rc_mlx5 a fenced WQE, which waits for earlier reads; UCX
+// turns it into a flush where a weak fence is not enough, e.g. multi-rail).
+int cx_fence(cx_ctx_t *c) { return ucp_worker_fence(c->worker); }
+
+// 1 when this context was set up for RDMA (see cx_rdma_usable).
+int cx_is_rdma(cx_ctx_t *c) { return c->rdma; }
 
 // Remote completion of all RMA posted on ep so far.
 void *cx_ep_flush(void *ep) {

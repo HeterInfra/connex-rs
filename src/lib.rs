@@ -746,6 +746,11 @@ impl Endpoint {
                     self.stats.eps_created += 1;
                     self.anon.insert(ep as usize);
                 }
+                // On failure the request is not rejected here on purpose:
+                // ucp_ep_create(conn_request) already rejects and frees it
+                // on nearly every error path (UCX 1.16 wireup_cm.c,
+                // ucp_ep.c), so a ucp_listener_reject now would be a use
+                // after free. The client then sees its connect fail.
             }
             ffi::EV_HELLO => {
                 let s = String::from_utf8_lossy(&ev.data[..ev.len as usize]).into_owned();
@@ -892,7 +897,33 @@ impl Endpoint {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return None;
             }
+            self.idle_wait(deadline);
         }
+    }
+
+    /// Sleeps on the worker's event fd until UCX has something to do, at
+    /// most until `deadline` and for 10 ms (heartbeats are sent from
+    /// `progress`). Before, `wait_event` and `wait_peer` busy-polled a core
+    /// for their whole timeout.
+    fn idle_wait(&mut self, deadline: Option<Instant>) {
+        let fd = self.efd();
+        if fd < 0 || !self.arm() {
+            return; // no fd, or work pending: progress again
+        }
+        let mut ms = 10i64;
+        if let Some(hb) = self.heartbeat {
+            ms = ms.min(hb.interval.as_millis() as i64);
+        }
+        if let Some(d) = deadline {
+            let left = d.saturating_duration_since(Instant::now());
+            ms = ms.min(left.as_micros().div_ceil(1000) as i64);
+        }
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut p, 1, ms.max(0) as i32) };
     }
 
     /// Pops a queued event without progressing.
@@ -1023,6 +1054,23 @@ impl Endpoint {
         ))
     }
 
+    /// Orders RMA: ops posted after the fence start only after the ops
+    /// posted before it (UCX worker fence).
+    pub fn fence(&mut self) -> Result<()> {
+        let st = unsafe { ffi::cx_fence(self.ctx) };
+        if st == 0 {
+            Ok(())
+        } else {
+            Err(ucx_err(st))
+        }
+    }
+
+    /// The context was set up for RDMA (an IB device usable under UCX_TLS
+    /// and UCX_NET_DEVICES).
+    pub fn is_rdma(&self) -> bool {
+        unsafe { ffi::cx_is_rdma(self.ctx) != 0 }
+    }
+
     /// Flushes `peer`'s endpoint: completes when all RMA posted before it
     /// is remotely complete.
     pub fn flush(&mut self, peer: &LogicalId) -> Result<Req> {
@@ -1106,6 +1154,12 @@ impl Endpoint {
     ///
     /// # Safety
     /// `ptr..ptr+len` must stay valid and unmodified until the op completes.
+    /// "Completes" includes the end of a canceled op: a [`Endpoint::wait`]
+    /// that times out cancels the op, and when UCX does not finish the
+    /// cancel at once (counted in [`Stats::cancel_deferred`]) it may still
+    /// access the memory until a later [`Endpoint::progress`] reaps it.
+    /// Dropping the returned [`Op`] without waiting does not cancel it at
+    /// all; the memory must then stay valid until the endpoint is dropped.
     pub unsafe fn post_send_ptr(
         &mut self,
         peer: &LogicalId,
@@ -1120,6 +1174,12 @@ impl Endpoint {
     ///
     /// # Safety
     /// `ptr..ptr+len` must stay valid and untouched until the op completes.
+    /// "Completes" includes the end of a canceled op: a [`Endpoint::wait`]
+    /// that times out cancels the op, and when UCX does not finish the
+    /// cancel at once (counted in [`Stats::cancel_deferred`]) it may still
+    /// access the memory until a later [`Endpoint::progress`] reaps it.
+    /// Dropping the returned [`Op`] without waiting does not cancel it at
+    /// all; the memory must then stay valid until the endpoint is dropped.
     pub unsafe fn post_recv_ptr(
         &mut self,
         peer: &LogicalId,
@@ -1241,10 +1301,13 @@ impl Endpoint {
     pub fn wait_peer(&mut self, peer: &LogicalId, timeout: Duration) -> bool {
         let deadline = deadline_in(timeout);
         while !self.peers.contains_key(peer) {
-            self.progress();
+            if self.progress() > 0 {
+                continue;
+            }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return false;
             }
+            self.idle_wait(deadline);
         }
         true
     }

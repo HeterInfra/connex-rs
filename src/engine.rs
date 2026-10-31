@@ -165,10 +165,20 @@ pub struct EngineStats {
 // ------------------------------------------------------------- completions
 
 /// A completion a caller can wait on (set once by the progress thread).
+///
+/// The result lives in a `OnceLock`; the mutex and condvar are only for
+/// callers that stopped spinning. The progress thread therefore takes the
+/// lock and makes the futex-wake syscall only when somebody is parked
+/// (`parked` and `flag` are a SeqCst Dekker pair: either the setter sees the
+/// waiter or the waiter sees the flag).
 pub struct Completion {
-    m: Mutex<Option<Result<()>>>,
+    r: std::sync::OnceLock<Result<()>>,
+    m: Mutex<()>,
     cv: Condvar,
     flag: AtomicBool,
+    parked: std::sync::atomic::AtomicU32,
+    /// The engine's "progress thread died" flag (callers' completions).
+    dead: Option<Arc<AtomicBool>>,
 }
 
 /// A waiter spins this long before sleeping on the condvar: most RMA on
@@ -177,31 +187,50 @@ const WAIT_SPIN: Duration = Duration::from_micros(30);
 
 impl Completion {
     fn new() -> Arc<Self> {
+        Self::make(None)
+    }
+
+    /// A completion a caller waits on: the wait ends with `Canceled` if
+    /// the progress thread dies (panics) before it answers.
+    fn for_caller(dead: &Arc<AtomicBool>) -> Arc<Self> {
+        Self::make(Some(dead.clone()))
+    }
+
+    fn make(dead: Option<Arc<AtomicBool>>) -> Arc<Self> {
         Arc::new(Completion {
-            m: Mutex::new(None),
+            r: std::sync::OnceLock::new(),
+            m: Mutex::new(()),
             cv: Condvar::new(),
             flag: AtomicBool::new(false),
+            parked: std::sync::atomic::AtomicU32::new(0),
+            dead,
         })
     }
 
+    fn is_dead(&self) -> bool {
+        self.dead.as_ref().is_some_and(|d| d.load(Ordering::SeqCst))
+    }
+
     fn set(&self, r: Result<()>) {
-        let mut g = self.m.lock().unwrap();
-        if g.is_none() {
-            *g = Some(r);
-            self.flag.store(true, Ordering::Release);
+        if self.r.set(r).is_err() {
+            return; // first result wins
+        }
+        self.flag.store(true, Ordering::SeqCst);
+        if self.parked.load(Ordering::SeqCst) > 0 {
+            drop(self.m.lock().unwrap());
             self.cv.notify_all();
         }
     }
 
     pub fn is_done(&self) -> bool {
-        self.m.lock().unwrap().is_some()
+        self.flag.load(Ordering::Acquire)
     }
 
     fn result(&self) -> Option<Result<()>> {
         if !self.flag.load(Ordering::Acquire) {
             return None;
         }
-        self.m.lock().unwrap().clone()
+        self.r.get().cloned()
     }
 
     /// Waits for the result. `None` timeout waits forever. A wait that
@@ -211,21 +240,36 @@ impl Completion {
         while !self.flag.load(Ordering::Acquire) && t0.elapsed() < WAIT_SPIN {
             std::hint::spin_loop();
         }
-        let mut g = self.m.lock().unwrap();
-        let deadline = timeout.and_then(deadline_in);
-        while g.is_none() {
-            match deadline {
-                None => g = self.cv.wait(g).unwrap(),
-                Some(d) => {
-                    let now = Instant::now();
-                    if now >= d {
-                        return None;
-                    }
-                    g = self.cv.wait_timeout(g, d - now).unwrap().0;
-                }
-            }
+        if self.flag.load(Ordering::Acquire) {
+            return self.r.get().cloned();
         }
-        g.clone()
+        let deadline = timeout.and_then(deadline_in);
+        self.parked.fetch_add(1, Ordering::SeqCst);
+        let mut g = self.m.lock().unwrap();
+        let mut out = None;
+        loop {
+            if self.flag.load(Ordering::SeqCst) {
+                out = self.r.get().cloned();
+                break;
+            }
+            if self.is_dead() {
+                out = Some(Err(Error::Invalid("connex-rs progress thread died".into())));
+                break;
+            }
+            // Slices of at most 100 ms so that a dead progress thread is
+            // noticed (it cannot answer any more).
+            let now = Instant::now();
+            let slice = Duration::from_millis(100);
+            let step = match deadline {
+                None => slice,
+                Some(d) if now >= d => break,
+                Some(d) => (d - now).min(slice),
+            };
+            g = self.cv.wait_timeout(g, step).unwrap().0;
+        }
+        drop(g);
+        self.parked.fetch_sub(1, Ordering::SeqCst);
+        out
     }
 }
 
@@ -273,6 +317,8 @@ enum Cmd {
     Stats {
         out: mpsc::Sender<EngineStats>,
     },
+    /// Test hook: panics the progress thread.
+    TestPanic,
 }
 
 struct Shared {
@@ -287,6 +333,8 @@ struct Shared {
     msgs: Mutex<VecDeque<(LogicalId, Vec<u8>)>>,
     msgs_cv: Condvar,
     wakeups: AtomicU64,
+    /// The progress thread panicked: nothing will answer any more.
+    dead: Arc<AtomicBool>,
 }
 
 impl Shared {
@@ -294,9 +342,9 @@ impl Shared {
     /// locks are taken so that a waiter between its `stop` check and its
     /// condvar wait cannot miss the notification.
     fn wake_waiters(&self) {
-        drop(self.events.lock().unwrap());
+        drop(self.events.lock().unwrap_or_else(|e| e.into_inner()));
         self.events_cv.notify_all();
-        drop(self.msgs.lock().unwrap());
+        drop(self.msgs.lock().unwrap_or_else(|e| e.into_inner()));
         self.msgs_cv.notify_all();
     }
 
@@ -358,6 +406,7 @@ impl Engine {
             msgs: Mutex::new(VecDeque::new()),
             msgs_cv: Condvar::new(),
             wakeups: AtomicU64::new(0),
+            dead: Arc::new(AtomicBool::new(false)),
         });
         let (tx, rx) = mpsc::channel();
         let sh = shared.clone();
@@ -370,7 +419,28 @@ impl Engine {
                 // when the context and endpoints are created, so the thread
                 // that creates them needs the caller's CUDA context.
                 crate::cuda_ctx_set(cuda_ctx);
-                run(c2, sh, tx, cuda_ctx)
+                let sh2 = sh.clone();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(c2, sh, tx, cuda_ctx)
+                }));
+                if r.is_err() {
+                    // A bug, not a peer failure: fail everything instead of
+                    // leaving callers waiting forever on a dead thread.
+                    // (Endpoints and memory of the dropped state are
+                    // released by their destructors during the unwind.)
+                    eprintln!("connex-rs: progress thread panicked; engine is shut down");
+                    sh2.dead.store(true, Ordering::SeqCst);
+                    sh2.stop.store(true, Ordering::SeqCst);
+                    let left = {
+                        let mut q = sh2.cmds.lock().unwrap_or_else(|e| e.into_inner());
+                        sh2.closed.store(true, Ordering::SeqCst);
+                        std::mem::take(&mut *q)
+                    };
+                    for c in left {
+                        fail_cmd(c, Error::Invalid("connex-rs progress thread died".into()));
+                    }
+                    sh2.wake_waiters();
+                }
             })
             .map_err(|e| Error::Invalid(format!("spawn: {e}")))?;
         let port = match rx.recv() {
@@ -420,7 +490,7 @@ impl Engine {
         make: impl FnOnce(Arc<Completion>) -> Cmd,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        let done = Completion::new();
+        let done = Completion::for_caller(&self.shared.dead);
         self.shared.push(make(done.clone()));
         done.wait(timeout).unwrap_or(Err(Error::Timeout))
     }
@@ -492,7 +562,7 @@ impl Engine {
                 "RMA range wraps: local {local:#x}, remote {remote:#x}, len {len}"
             )));
         }
-        let done = Completion::new();
+        let done = Completion::for_caller(&self.shared.dead);
         let deadline = op_deadline(timeout.unwrap_or(DEFAULT_OP_TIMEOUT));
         self.shared.push(Cmd::Rma {
             cuda_ctx: crate::cuda_ctx_current(),
@@ -559,7 +629,7 @@ impl Engine {
                 spec.src, spec.dst, spec.len
             )));
         }
-        let done = Completion::new();
+        let done = Completion::for_caller(&self.shared.dead);
         self.shared.push(Cmd::Chain {
             cuda_ctx: crate::cuda_ctx_current(),
             url,
@@ -641,6 +711,13 @@ impl Engine {
         let mut s = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
         s.wakeups = self.shared.wakeups.load(Ordering::Relaxed);
         s
+    }
+
+    /// Test hook: makes the progress thread panic (checks that callers
+    /// are answered instead of waiting forever).
+    #[doc(hidden)]
+    pub fn test_panic(&self) {
+        self.shared.push(Cmd::TestPanic);
     }
 
     /// Stops the progress thread (closes all endpoints). Idempotent.
@@ -768,8 +845,13 @@ fn chain_poll_pause(idle: Duration) -> Duration {
         Duration::from_micros(5)
     } else if idle < Duration::from_millis(5) {
         Duration::from_micros(10)
-    } else {
+    } else if idle < Duration::from_millis(100) {
         Duration::from_micros(20)
+    } else if idle < Duration::from_secs(1) {
+        // nothing for 100 ms (no step in flight): 0.2 -> ~0.1 cores
+        Duration::from_micros(50)
+    } else {
+        Duration::from_micros(100)
     }
 }
 
@@ -785,12 +867,20 @@ const GATE_POLL_MIN: Duration = Duration::from_micros(2);
 const GATE_POLL_MAX: Duration = Duration::from_micros(200);
 
 const CANCEL: u32 = 0x7FFF_FFFF;
+/// One RMA of the fenced chain sequence: (is_put, local, remote, len,
+/// remote region base, its rkey, local memory handle).
+type FencedOp = (bool, u64, u64, u64, u64, Rc<Rkey>, *mut std::ffi::c_void);
+
+/// Chain stage: the fenced put / readback / flag sequence is posted.
+const FENCED: u8 = 10;
 
 struct Chain {
     peer: LogicalId,
     spec: ChainSpec,
     stage: u8,
     cur: Option<Arc<Completion>>,
+    /// Fenced path: the data put and the readback, done before `cur`.
+    fenced: Vec<Arc<Completion>>,
     /// Gate read destination and flag put source (host, unregistered).
     scratch: Box<[u32; 2]>,
     done: Arc<Completion>,
@@ -842,6 +932,8 @@ struct State {
     stats: EngineStats,
     /// Smallest RMA allowed on registered GPU memory (crate::gpu_rma_min).
     gpu_rma_min: u64,
+    /// RDMA context: put chains use the fenced sequence.
+    rdma: bool,
 }
 
 fn rd64(b: &[u8], off: usize) -> u64 {
@@ -905,7 +997,9 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         cuda_ctx,
         stats: EngineStats::default(),
         gpu_rma_min: crate::gpu_rma_min(),
+        rdma: false,
     };
+    st.rdma = st.ep.is_rdma() && std::env::var_os("CONNEX_RS_CHAIN_SERIAL").is_none();
     let spin = cfg.spin;
     let hb_tick = cfg
         .heartbeat
@@ -982,7 +1076,12 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
                 unsafe { libc::read(sh.cmd_fd, &mut v as *mut u64 as *mut libc::c_void, 8) };
             }
         }
-        last_work = Instant::now();
+        if n > 0 {
+            // Woken by traffic: spin again (more is likely to follow). A
+            // timer wake (heartbeat tick, deadline) does not restart the
+            // spin, which cost every idle engine 0.5% of a core.
+            last_work = Instant::now();
+        }
     }
     // Shutdown. Close every endpoint first: answering callers frees their
     // buffers (and the chains' scratch words), and RDMA already posted on a
@@ -1033,7 +1132,7 @@ fn fail_cmd(c: Cmd, e: Error) {
         | Cmd::Chain { done, .. }
         | Cmd::Connect { done, .. }
         | Cmd::Disconnect { done, .. } => done.set(Err(e)),
-        Cmd::Stats { .. } => {}
+        Cmd::Stats { .. } | Cmd::TestPanic => {}
     }
 }
 
@@ -1159,6 +1258,7 @@ impl State {
                     spec,
                     stage: 0,
                     cur: None,
+                    fenced: Vec::new(),
                     scratch: Box::new([0, 0]),
                     done,
                     armed: Instant::now(),
@@ -1183,6 +1283,7 @@ impl State {
                 self.peer_gone(&peer, Error::PeerFailed(peer.clone()));
                 done.set(Ok(()));
             }
+            Cmd::TestPanic => panic!("connex-rs test panic"),
             Cmd::Stats { out } => {
                 let mut s = self.stats.clone();
                 s.ep = self.ep.stats();
@@ -1290,19 +1391,33 @@ impl State {
             )
         };
         match r {
-            Ok(req) => self.inflight.push(Inflight {
-                peer: peer.clone(),
-                req,
-                base,
-                local: w.local,
-                len: w.len,
-                _rkey: rkey,
-                deadline: w.deadline,
-                is_put: w.is_put,
-                signal: w.signal,
-                flushing: false,
-                done: w.done,
-            }),
+            Ok(mut req) => {
+                // A put completes once remotely complete: post the flush
+                // right behind it instead of after its local completion
+                // (one progress pass and, over TCP, one round trip less).
+                // The flush completes only after the put, so the put's own
+                // request is just reaped.
+                let mut flushing = false;
+                if w.is_put {
+                    if let Ok(f) = self.ep.flush(peer) {
+                        self.orphans.push(std::mem::replace(&mut req, f));
+                        flushing = true;
+                    }
+                }
+                self.inflight.push(Inflight {
+                    peer: peer.clone(),
+                    req,
+                    base,
+                    local: w.local,
+                    len: w.len,
+                    _rkey: rkey,
+                    deadline: w.deadline,
+                    is_put: w.is_put,
+                    signal: w.signal,
+                    flushing,
+                    done: w.done,
+                })
+            }
             Err(e) => {
                 self.stats.rma_err += 1;
                 w.done.set(Err(e));
@@ -1350,6 +1465,9 @@ impl State {
             match o.req.test() {
                 None => {
                     if now >= o.deadline {
+                        // counted per op (an expired rkey wait below too);
+                        // the peer drop that follows is not counted again
+                        self.stats.op_timeouts += 1;
                         timed_out.push(o.peer.clone());
                     }
                     i += 1;
@@ -1414,9 +1532,11 @@ impl State {
         timed_out.dedup();
         for peer in timed_out {
             if !self.ep.is_connected(&peer) {
+                // already closed: just fail what is left (so a timed-out op
+                // is neither counted nor reported twice)
+                self.peer_gone(&peer, Error::Timeout);
                 continue;
             }
-            self.stats.op_timeouts += 1;
             self.ep.drop_peer(&peer);
             self.peer_gone(&peer, Error::Timeout);
             self.publish(Event::PeerFailed {
@@ -1572,6 +1692,33 @@ impl State {
                         },
                     }
                 }
+                2 if c.cur.is_none() && self.rdma => {
+                    // RDMA: post data put, readback and flag put at once,
+                    // ordered by fences, instead of one round trip each.
+                    if let Some(d) = self.chain_fenced(c) {
+                        c.cur = Some(d);
+                        c.stage = FENCED;
+                        return None;
+                    }
+                    // keys not cached yet (first use): serial steps
+                    let src = c.spec.src;
+                    let (dst, len) = (c.spec.dst, c.spec.len);
+                    if dst == 0 || len == 0 {
+                        c.stage = 3;
+                        continue;
+                    }
+                    c.cur = Some(self.chain_rma(&c.peer, true, src, dst, len, c.spec.timeout));
+                    return None;
+                }
+                FENCED => {
+                    let r = c.cur.as_ref().unwrap().result()?;
+                    for d in &c.fenced {
+                        if let Err(e) = d.result()? {
+                            return Some(Err(e));
+                        }
+                    }
+                    return Some(r);
+                }
                 2 | 4 => {
                     let (src, dst, len) = if c.stage == 2 {
                         (c.spec.src, c.spec.dst, c.spec.len)
@@ -1601,6 +1748,110 @@ impl State {
                 _ => return Some(Ok(())),
             }
         }
+    }
+
+    /// Posts the data put, the 4-byte readback of its last word and the
+    /// flag put back to back, separated by worker fences, and returns the
+    /// completion of a flush behind them (the completions of the first two
+    /// go to `c.fenced`). The readback cannot pass the data writes (RC
+    /// executes a QP's requests in order, a PCIe read does not pass posted
+    /// writes) and the fence keeps the flag put until the readback has
+    /// returned, so the flag still lands only after the data is in the
+    /// peer's memory, as with the serial steps, without three CPU round
+    /// trips. None when a key is not cached or a check fails: the serial
+    /// path then handles (and reports) it.
+    fn chain_fenced(&mut self, c: &mut Chain) -> Option<Arc<Completion>> {
+        let sp = &c.spec;
+        if sp.dst == 0 || sp.len == 0 || sp.flag == 0 || !range_ok(sp.flag, 4) {
+            return None;
+        }
+        let (dbase, dkey) = self.find_remote(&c.peer, sp.dst, sp.len)?;
+        let (fbase, fkey) = self.find_remote(&c.peer, sp.flag, 4)?;
+        let (memh, mt) = self.local_memh(sp.src, sp.len);
+        if !crate::rma_len_ok(mt, sp.len, self.gpu_rma_min) || !self.ep.is_connected(&c.peer) {
+            return None;
+        }
+        let deadline = op_deadline(sp.timeout.unwrap_or(DEFAULT_OP_TIMEOUT));
+        let readback = sp.len >= 4;
+        c.scratch[1] = sp.flag_val;
+        let scratch = c.scratch.as_mut_ptr() as u64;
+        let ops: [FencedOp; 3] = [
+            (true, sp.src, sp.dst, sp.len, dbase, dkey.clone(), memh),
+            (
+                false,
+                scratch,
+                sp.dst + (sp.len & !3) - 4,
+                4,
+                dbase,
+                dkey,
+                std::ptr::null_mut(),
+            ),
+            (
+                true,
+                scratch + 4,
+                sp.flag,
+                4,
+                fbase,
+                fkey,
+                std::ptr::null_mut(),
+            ),
+        ];
+        c.fenced.clear();
+        let peer = c.peer.clone();
+        let n = ops.len();
+        for (i, (is_put, local, remote, len, base, rkey, mh)) in ops.into_iter().enumerate() {
+            if i == 1 && !readback {
+                continue;
+            }
+            let done = Completion::new();
+            if i > 0 {
+                if let Err(e) = self.ep.fence() {
+                    done.set(Err(e));
+                    return Some(done);
+                }
+            }
+            let r = unsafe {
+                self.ep
+                    .post_rma(&peer, is_put, local, len as usize, remote, &rkey, mh)
+            };
+            let mut req = match r {
+                Ok(q) => q,
+                Err(e) => {
+                    self.stats.rma_err += 1;
+                    done.set(Err(e));
+                    return Some(done);
+                }
+            };
+            if i == n - 1 {
+                // remote completion of the whole sequence
+                match self.ep.flush(&peer) {
+                    Ok(f) => self.orphans.push(std::mem::replace(&mut req, f)),
+                    Err(e) => {
+                        self.orphans.push(req);
+                        done.set(Err(e));
+                        return Some(done);
+                    }
+                }
+            }
+            self.inflight.push(Inflight {
+                peer: peer.clone(),
+                req,
+                base,
+                local,
+                len,
+                _rkey: rkey,
+                deadline,
+                is_put,
+                signal: None,
+                flushing: true,
+                done: done.clone(),
+            });
+            if i == n - 1 {
+                return Some(done);
+            }
+            c.fenced.push(done);
+        }
+        None
     }
 
     fn chain_rma(

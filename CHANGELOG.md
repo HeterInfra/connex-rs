@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+Performance (numbers in the README, "Data-plane microbenchmarks"):
+
+- Connect to first read over rc_mlx5: 0.3-1.7 s down to about 50 ms. The IB
+  transports allocated their 10-40 MB buffer pools with transparent huge
+  pages, a direct-compaction stall on a host with fragmented memory. The
+  engine now sets `IB_ALLOC=mmap,heap` on its UCX config (unless
+  `UCX_*_ALLOC` is set).
+- `put_chain` over RDMA posts the data put, the readback of its last word
+  and the flag put back to back, ordered by UCX worker fences, instead of
+  waiting a round trip after each: 11.7 to 7.7 µs at 4 KB cross-host. The
+  flag still lands only after the data (checked with a consumer that polls
+  the flag and reads the data in GPU memory, 9000 chains, 0 stale).
+  `CONNEX_RS_CHAIN_SERIAL=1` restores the serial steps.
+- Puts post their completion flush right behind the put (one progress pass
+  and, over TCP, about 10% less latency).
+- A completion takes no lock and makes no futex wake when its waiter is
+  still spinning.
+- Idle CPU: an epoll wake by the timer no longer restarts the 500 µs busy
+  poll (an idle engine used 0.5% of a core, now 0.03%), and armed chains
+  back off to 50 µs after 100 ms and 100 µs after 1 s of idle (22% to 7% of
+  a core while a chain waits).
+- TCP: `TCP_TX_SEG_SIZE`/`TCP_RX_SEG_SIZE=256k` (unless set): reads over
+  TCP 0.9 to 3.3 GB/s at 1 MB.
+- Python: the wheel is stripped (2.5 MB to 0.43 MB, installed 9 MB to
+  1 MB); `send_msg`/`put_signal` copy a `bytes` payload with one memcpy
+  instead of item by item (1 MB message: 21 to 3.6 ms); copies of 64 KB or
+  more in `write_bytes_to_buffer`/`read_bytes_from_buffer` release the GIL.
+
+Fixes:
+
+- A panic on the progress thread left every caller waiting forever. It now
+  fails queued commands, ends waits with an error within 100 ms and marks
+  the engine shut down.
+- `Endpoint.wait_event` and `wait_peer` busy-polled a core for their whole
+  timeout; they now sleep on the worker's event fd between progress calls.
+- `op_timeouts` counted a timed-out op once more for its peer; it now
+  counts each timed-out op once.
+- `post_send_ptr`/`post_recv_ptr`: documented that a cancel deferred after
+  a timed-out wait, or a dropped `Op`, keeps the memory in use.
+- A failed accept is left to UCX on purpose (it already rejects and frees
+  the connection request); documented at the call.
+
+Tools: `cxrma`, a data-plane microbenchmark (latency, bandwidth, put_chain,
+connect time, idle CPU, chain ordering check), host or GPU memory.
+
 ## 0.1.5
 
 - RMA from or into registered GPU memory below UCX's zero-copy threshold is

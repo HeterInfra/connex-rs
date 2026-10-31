@@ -589,3 +589,39 @@ fn unregister_waits_for_local_inflight_rma() {
     assert!(read(dst, n) == want, "data intact");
     drop(buf);
 }
+
+#[test]
+fn progress_thread_panic_answers_callers() {
+    let ip = setup();
+    let a = engine(&ip, 40, 0);
+    let b = engine(&ip, 41, 0);
+    let dst = b.alloc_managed(4096).unwrap();
+    let src = a.alloc_managed(4096).unwrap();
+    // a chain armed on a doorbell that never rings: pending until answered
+    let bell = Box::new(0u32);
+    let c = a
+        .put_chain(
+            b.local_url(),
+            connex_rs::engine::ChainSpec {
+                doorbell: &*bell as *const u32 as u64,
+                doorbell_val: 1,
+                src,
+                dst,
+                len: 4096,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    a.test_panic();
+    let t = Instant::now();
+    let r = c.wait(Some(Duration::from_secs(5)));
+    assert!(matches!(r, Some(Err(_))), "{r:?}");
+    assert!(t.elapsed() < Duration::from_secs(2));
+    // later calls fail at once instead of hanging
+    let t = Instant::now();
+    assert!(a.connect(b.local_url()).is_err());
+    assert!(a.register(src, 64).is_err());
+    assert!(t.elapsed() < Duration::from_secs(1));
+    a.shutdown();
+    drop(bell);
+}
