@@ -117,6 +117,8 @@ extern "C" {
         memh: *mut c_void,
     ) -> *mut c_void;
     pub fn cx_ep_flush(ep: *mut c_void) -> *mut c_void;
+    pub fn cx_fence(c: *mut CxCtx) -> c_int;
+    pub fn cx_is_rdma(c: *mut CxCtx) -> c_int;
     pub fn cx_err_canceled() -> c_int;
     #[cfg(test)]
     pub fn cx_test_ring_at(c: *mut CxCtx, pos: u32);

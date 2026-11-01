@@ -101,6 +101,45 @@ is why `auto` keeps Mooncake on hosts without RDMA, and individual requests
 can still stall for up to about 1 s (worst request 1.03 s at 1 step in
 flight, 0.92 s at 4) even though the per-run medians are far lower.
 
+### Data-plane microbenchmarks
+
+`cxrma` (`src/bin/cxrma.rs`) measures the engine itself: blocking get/put
+latency, streaming bandwidth, `put_chain` latency, time from `connect` to
+the first read, and idle CPU. Two hosts with A40 GPUs and one ConnectX EDR
+port each (100 Gb/s, 12.5 GB/s), host memory, UCX 1.20, p50 over 3000
+operations, median of 3 runs. "Before" is 0.1.5, "after" this release.
+
+| cross-host, rc_mlx5 | before | after |
+|---|---|---|
+| get / put, 4 KB | 5.4 / 5.9 µs | 5.5 / 5.7 µs |
+| get / put, 16 KB | 6.9 / 7.0 µs | 6.7 / 6.7 µs |
+| `put_chain` (put, flag), 4 KB | 11.7 µs | 7.7 µs |
+| `put_chain`, 16 KB | 12.8 µs | 8.8 µs |
+| get / put, 32 MB | 11.9 / 11.9 GB/s | 11.9 / 11.9 GB/s |
+| connect to first read | 0.30-0.71 s | 54 ms |
+| idle CPU, two engines in one process, no heartbeat | 1.1% of a core | 0.07% |
+| same, with one chain armed | 22% of a core | 7% |
+
+Large transfers already run at the link rate (95% of 12.5 GB/s, with or
+without several ops in flight), so the engine does not split them. GPU
+memory is limited by PCIe, not by the engine: on one host through the HCA,
+GPU to GPU reads reach 9.2 GB/s with connex-rs and 9.3 GB/s with
+`ucx_perftest` between the two GPUs that sit behind the NIC's PCIe host
+bridge, and `ucx_perftest` reaches only 7.7 GB/s between GPUs attached to
+the other CPU socket. Over TCP (`UCX_TLS=tcp`, loopback) a 1 MB read went
+from 0.9 to 3.3 GB/s and a 4 KB put from 46 to 41 µs.
+
+In a full pipeline (vLLM PP=2 across two hosts, this build), the first
+`put_chain` on a freshly opened push channel completes 0.4-17 ms after the
+channel opens, and stage 0 switches to a spare replica 1-3 ms after
+connex-rs reports the active one failed.
+
+Reproduce: `cargo build --release`, then `target/release/cxrma local --ip
+<ib ip>` on one host, or `cxrma owner` on one host and `cxrma reader --url
+<url> --addr <addr>` on the other (`--gpu-owner D --gpu-reader D` for GPU
+memory, `--verify-chain` checks that a consumer never sees a chain's flag
+before its data).
+
 ## Layout
 
 | path | what |
@@ -110,6 +149,7 @@ flight, 0.92 s at 4) even though the per-run medians are far lower.
 | `src/lib.rs` | `Endpoint` (single-threaded UCX endpoint keyed by `LogicalId`, heartbeat, rejoin), `Event` |
 | `src/python.rs` | PyO3 module `connex_rs` (`Engine`, `Transfer`, and the step-1 `Endpoint`) |
 | `src/bin/cxbench.rs` | failure-detection / rejoin benchmark (step 1) |
+| `src/bin/cxrma.rs` | data-plane microbenchmarks (latency, bandwidth, put_chain, connect, idle CPU), host or GPU |
 | `tests/` | integration tests over real UCX (threads and processes) |
 | `python/rma_bench.py` | one-sided read latency/bandwidth, host or GPU, local or cross-host |
 | `python/churn_peer.py` | kill/rejoin a peer under the same id N times against a live engine (leak check) |
@@ -170,7 +210,12 @@ other UCX error.
 * `UCX_NET_DEVICES`: pin the RDMA device and its IPoIB interface
   (`connex.pp` does this automatically, `CONNEX_RS_NET_DEVICES=auto`). On
   hosts with container or VPN interfaces UCX otherwise tries those and the
-  connection fails. HCA names can differ between hosts.
+  connection fails. HCA names can differ between hosts. The list must also
+  name the interface that carries the listen address (`lo` for 127.0.0.1)
+  unless that is the IPoIB interface of a listed RDMA device: UCX's
+  connection manager only uses listed devices. `listen` rejects such an
+  address with an error that names the interface; earlier versions joined
+  and then failed every connect with "Destination is unreachable".
 * Protocol: when RDMA is usable the engine sets `PROTO_ENABLE=n` on its own
   UCX configuration. UCX 1.16's protocol v2 selects software emulation for
   get/put on CUDA memory over client/server endpoints, while v1 does
@@ -180,6 +225,16 @@ other UCX error.
 * `UCX_TCP_CM_REUSEADDR=y` (set by `connex.pp`): a restarted stage can listen
   on its port again at once.
 * `CONNEX_RS_DEBUG=1` prints every event and failed transfer.
+* Defaults the engine sets on its own UCX configuration unless the
+  variable is set: `IB_ALLOC=mmap,heap` when RDMA is usable (the IB
+  transports' buffer pools otherwise use transparent huge pages, and on a
+  host with fragmented memory the compaction stall made a connect take up
+  to 1.7 s), and `TCP_TX_SEG_SIZE` / `TCP_RX_SEG_SIZE=256k` when TCP is in
+  use (reads over TCP are emulated in segments of that size; 8 KB gave
+  0.9 GB/s).
+* On hosts with many network interfaces (containers, VPN), a TCP connect
+  spends 100-400 ms in UCX computing configurations for every interface;
+  `UCX_NET_DEVICES` cuts that as well.
 
 ## Limits
 

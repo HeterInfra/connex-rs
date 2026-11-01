@@ -83,6 +83,91 @@ fn parse_zcopy_thresh(v: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_ZCOPY_THRESH)
 }
 
+/// Why an endpoint listening on (or connecting to) `ip` cannot work with
+/// the configured UCX devices, if so: `UCX_NET_DEVICES` lists devices but
+/// not the interface that carries `ip` (`lo` for a loopback address). UCX's
+/// connection manager only uses listed devices: the endpoint wires up, fails
+/// with "Destination is unreachable", and every reconnect fails the same way.
+/// An interface on a listed RDMA device (IPoIB) is reached through rdmacm.
+pub fn net_devices_exclude(ip: &str) -> Option<String> {
+    let devices = std::env::var("UCX_NET_DEVICES").ok()?;
+    net_devices_exclude_with(ip, &devices, iface_of, |iface, dev| {
+        std::path::Path::new("/sys/class/net")
+            .join(iface)
+            .join("device/infiniband")
+            .join(dev)
+            .exists()
+    })
+}
+
+fn net_devices_exclude_with(
+    ip: &str,
+    devices: &str,
+    iface_of: impl Fn(std::net::Ipv4Addr) -> Option<String>,
+    on_rdma_dev: impl Fn(&str, &str) -> bool,
+) -> Option<String> {
+    let devices = devices.trim();
+    let listed: Vec<&str> = devices.split(',').map(str::trim).collect();
+    // "^..." is a deny list: anything not named is usable, not checked here.
+    if devices.is_empty()
+        || devices.starts_with('^')
+        || listed.iter().any(|d| d.eq_ignore_ascii_case("all"))
+    {
+        return None;
+    }
+    let addr = ip
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+    let iface = match addr {
+        a if a.is_loopback() => "lo".to_string(),
+        // An address alias ("eth0:1") belongs to the interface "eth0".
+        std::net::IpAddr::V4(a) if !a.is_unspecified() => {
+            let name = iface_of(a)?;
+            name.split(':').next().unwrap_or(&name).to_string()
+        }
+        _ => return None,
+    };
+    let reached = listed.contains(&iface.as_str())
+        || listed
+            .iter()
+            .filter_map(|d| d.split_once(':').map(|(dev, _)| dev))
+            .any(|dev| on_rdma_dev(&iface, dev));
+    (!reached).then(|| {
+        format!(
+            "{ip} is on interface {iface:?}, which UCX_NET_DEVICES={devices:?} does not list \
+             (add \"{iface}\", unset UCX_NET_DEVICES, or use an address on a listed interface)"
+        )
+    })
+}
+
+/// The interface that carries the IPv4 address `a`.
+fn iface_of(a: std::net::Ipv4Addr) -> Option<String> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+    let mut out = None;
+    let mut p = head;
+    while !p.is_null() {
+        let ifa = unsafe { &*p };
+        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET {
+            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            if u32::from_be(sin.sin_addr.s_addr) == u32::from(a) {
+                out = Some(
+                    unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                break;
+            }
+        }
+        p = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(head) };
+    out
+}
+
 /// Whether an RMA of `len` bytes from/into local memory of `mem_type`
 /// (ucs_memory_type_t: 0 host, 1 CUDA, 2 CUDA managed, ...) is safe; see
 /// [`gpu_rma_min`].
@@ -467,6 +552,9 @@ impl Endpoint {
 
     /// Listens on `ip:port` (port 0 = ephemeral). Returns the bound port.
     pub fn listen(&mut self, ip: &str, port: u16) -> Result<u16> {
+        if let Some(why) = net_devices_exclude(ip) {
+            return Err(Error::Invalid(why));
+        }
         let cip = CString::new(ip).map_err(|_| Error::Invalid(ip.into()))?;
         let r = unsafe { ffi::cx_listen(self.ctx, cip.as_ptr(), port) };
         if r <= 0 {
@@ -484,6 +572,16 @@ impl Endpoint {
         // not cost the caller a working link.
         if !ip.is_empty() && ip.parse::<std::net::Ipv4Addr>().is_err() {
             return Err(Error::Invalid(format!("not an IPv4 address: {ip:?}")));
+        }
+        // (A remote address is on no local interface: only a loopback
+        // target can be checked here.)
+        if ip
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|a| a.is_loopback())
+        {
+            if let Some(why) = net_devices_exclude(ip) {
+                return Err(Error::Invalid(why));
+            }
         }
         let cip = CString::new(ip).map_err(|_| Error::Invalid(ip.into()))?;
         self.drop_peer(peer);
@@ -746,6 +844,11 @@ impl Endpoint {
                     self.stats.eps_created += 1;
                     self.anon.insert(ep as usize);
                 }
+                // On failure the request is not rejected here on purpose:
+                // ucp_ep_create(conn_request) already rejects and frees it
+                // on nearly every error path (UCX 1.16 wireup_cm.c,
+                // ucp_ep.c), so a ucp_listener_reject now would be a use
+                // after free. The client then sees its connect fail.
             }
             ffi::EV_HELLO => {
                 let s = String::from_utf8_lossy(&ev.data[..ev.len as usize]).into_owned();
@@ -892,7 +995,35 @@ impl Endpoint {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return None;
             }
+            self.idle_wait(deadline);
         }
+    }
+
+    /// Sleeps on the worker's event fd until UCX has something to do, at
+    /// most until `deadline` and for 10 ms (heartbeats are sent from
+    /// `progress`). Before, `wait_event` and `wait_peer` busy-polled a core
+    /// for their whole timeout.
+    fn idle_wait(&mut self, deadline: Option<Instant>) {
+        let fd = self.efd();
+        if fd < 0 || !self.arm() {
+            return; // no fd, or work pending: progress again
+        }
+        let mut ms = 10i64;
+        if let Some(hb) = self.heartbeat {
+            // at least 1 ms: a sub-millisecond interval must not turn this
+            // into a busy poll
+            ms = ms.min((hb.interval.as_millis() as i64).max(1));
+        }
+        if let Some(d) = deadline {
+            let left = d.saturating_duration_since(Instant::now());
+            ms = ms.min(left.as_micros().div_ceil(1000) as i64);
+        }
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut p, 1, ms.max(0) as i32) };
     }
 
     /// Pops a queued event without progressing.
@@ -1023,6 +1154,23 @@ impl Endpoint {
         ))
     }
 
+    /// Orders RMA: ops posted after the fence start only after the ops
+    /// posted before it (UCX worker fence).
+    pub fn fence(&mut self) -> Result<()> {
+        let st = unsafe { ffi::cx_fence(self.ctx) };
+        if st == 0 {
+            Ok(())
+        } else {
+            Err(ucx_err(st))
+        }
+    }
+
+    /// The context was set up for RDMA (an IB device usable under UCX_TLS
+    /// and UCX_NET_DEVICES).
+    pub fn is_rdma(&self) -> bool {
+        unsafe { ffi::cx_is_rdma(self.ctx) != 0 }
+    }
+
     /// Flushes `peer`'s endpoint: completes when all RMA posted before it
     /// is remotely complete.
     pub fn flush(&mut self, peer: &LogicalId) -> Result<Req> {
@@ -1106,6 +1254,12 @@ impl Endpoint {
     ///
     /// # Safety
     /// `ptr..ptr+len` must stay valid and unmodified until the op completes.
+    /// "Completes" includes the end of a canceled op: a [`Endpoint::wait`]
+    /// that times out cancels the op, and when UCX does not finish the
+    /// cancel at once (counted in [`Stats::cancel_deferred`]) it may still
+    /// access the memory until a later [`Endpoint::progress`] reaps it.
+    /// Dropping the returned [`Op`] without waiting does not cancel it at
+    /// all; the memory must then stay valid until the endpoint is dropped.
     pub unsafe fn post_send_ptr(
         &mut self,
         peer: &LogicalId,
@@ -1120,6 +1274,12 @@ impl Endpoint {
     ///
     /// # Safety
     /// `ptr..ptr+len` must stay valid and untouched until the op completes.
+    /// "Completes" includes the end of a canceled op: a [`Endpoint::wait`]
+    /// that times out cancels the op, and when UCX does not finish the
+    /// cancel at once (counted in [`Stats::cancel_deferred`]) it may still
+    /// access the memory until a later [`Endpoint::progress`] reaps it.
+    /// Dropping the returned [`Op`] without waiting does not cancel it at
+    /// all; the memory must then stay valid until the endpoint is dropped.
     pub unsafe fn post_recv_ptr(
         &mut self,
         peer: &LogicalId,
@@ -1241,10 +1401,13 @@ impl Endpoint {
     pub fn wait_peer(&mut self, peer: &LogicalId, timeout: Duration) -> bool {
         let deadline = deadline_in(timeout);
         while !self.peers.contains_key(peer) {
-            self.progress();
+            if self.progress() > 0 {
+                continue;
+            }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return false;
             }
+            self.idle_wait(deadline);
         }
         true
     }
@@ -1367,5 +1530,43 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 32);
+    }
+}
+
+#[cfg(test)]
+mod net_devices_tests {
+    fn f(ip: &str, devices: &str, own: fn(std::net::Ipv4Addr) -> Option<String>) -> Option<String> {
+        super::net_devices_exclude_with(ip, devices, own, |iface, dev| {
+            iface == "ib0" && dev == "mlx5_0"
+        })
+    }
+
+    fn own(a: std::net::Ipv4Addr) -> Option<String> {
+        if a == std::net::Ipv4Addr::new(10, 0, 0, 2) {
+            return Some("ib0".into());
+        }
+        if a == std::net::Ipv4Addr::new(10, 0, 0, 4) {
+            return Some("eth1:1".into()); // an address alias
+        }
+        (a == std::net::Ipv4Addr::new(10, 0, 0, 3)).then(|| "eth1".to_string())
+    }
+
+    #[test]
+    fn listen_interface_must_be_listed() {
+        assert!(f("127.0.0.1", "mlx5_0:1,ib0", own).is_some());
+        assert!(f("::1", "mlx5_0:1", own).is_some());
+        assert!(f("127.0.0.1", "mlx5_0:1,ib0,lo", own).is_none());
+        assert!(f("10.0.0.3", "mlx5_0:1,ib0", own).is_some());
+        assert!(f("10.0.0.3", "mlx5_0:1,eth1", own).is_none());
+        assert!(f("127.0.0.1", "all", own).is_none());
+        assert!(f("127.0.0.1", "", own).is_none());
+        assert!(f("10.0.0.1", "mlx5_0:1", own).is_none()); // on no local interface
+        assert!(f("10.0.0.2", "mlx5_0:1", own).is_none()); // IPoIB of a listed device
+        assert!(f("10.0.0.2", "mlx5_1:1", own).is_some());
+        assert!(f("0.0.0.0", "mlx5_0:1", own).is_none());
+        assert!(f("", "mlx5_0:1", own).is_none());
+        assert!(f("10.0.0.4", "mlx5_0:1,eth1", own).is_none()); // alias of a listed interface
+        assert!(f("10.0.0.4", "mlx5_0:1", own).is_some());
+        assert!(f("127.0.0.1", "^mlx5_1:1", own).is_none()); // deny list: not checked
     }
 }

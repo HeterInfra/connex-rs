@@ -42,13 +42,28 @@ fn tup(p: &LogicalId) -> PeerT {
 
 fn to_py(e: Error) -> PyErr {
     match e {
-        Error::Timeout => PyTimeoutError::new_err("timeout"),
+        Error::Timeout => PyTimeoutError::new_err(
+            "connex-rs: operation timed out (peer hung or unreachable; its connection was closed)",
+        ),
         Error::PeerFailed(p) => PyConnectionError::new_err(format!("peer {p} failed")),
         Error::UnknownPeer(p) => PyConnectionError::new_err(format!("unknown peer {p}")),
         Error::Invalid(s) => PyValueError::new_err(s),
         e => PyRuntimeError::new_err(e.to_string()),
     }
 }
+
+/// A message payload: `bytes` is copied with one memcpy (extracting a
+/// `Vec<u8>` walks it as a sequence, item by item); other buffers such as
+/// bytearray or lists of ints still work through that slower path.
+fn bytes_arg(o: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    match o.downcast::<PyBytes>() {
+        Ok(b) => Ok(b.as_bytes().to_vec()),
+        Err(_) => o.extract(),
+    }
+}
+
+/// Copies at least this large release the GIL.
+const GIL_COPY_MIN: usize = 64 << 10;
 
 fn ms(t: Option<u64>) -> Option<Duration> {
     t.map(Duration::from_millis)
@@ -382,11 +397,27 @@ impl PyEngine {
     }
 
     /// Copies `data[:length]` to host address `ptr` (a managed buffer).
-    fn write_bytes_to_buffer(&self, ptr: u64, data: &[u8], length: usize) -> PyResult<()> {
+    /// Large copies release the GIL (`data` is immutable bytes the caller
+    /// holds for the duration of the call).
+    fn write_bytes_to_buffer(
+        &self,
+        py: Python<'_>,
+        ptr: u64,
+        data: &[u8],
+        length: usize,
+    ) -> PyResult<()> {
         if length > data.len() {
             return Err(PyValueError::new_err("length > len(data)"));
         }
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, length) };
+        let src = data.as_ptr() as usize;
+        let copy = move || unsafe {
+            std::ptr::copy_nonoverlapping(src as *const u8, ptr as *mut u8, length)
+        };
+        if length >= GIL_COPY_MIN {
+            py.allow_threads(copy);
+        } else {
+            copy();
+        }
         Ok(())
     }
 
@@ -395,9 +426,18 @@ impl PyEngine {
         py: Python<'py>,
         ptr: u64,
         length: usize,
-    ) -> Bound<'py, PyBytes> {
-        PyBytes::new_bound(py, unsafe {
-            std::slice::from_raw_parts(ptr as *const u8, length)
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        PyBytes::new_bound_with(py, length, |buf| {
+            let dst = buf.as_mut_ptr() as usize;
+            let copy = move || unsafe {
+                std::ptr::copy_nonoverlapping(ptr as *const u8, dst as *mut u8, length)
+            };
+            if length >= GIL_COPY_MIN {
+                py.allow_threads(copy);
+            } else {
+                copy();
+            }
+            Ok(())
         })
     }
 
@@ -527,9 +567,10 @@ impl PyEngine {
         src_ptr: u64,
         dst_ptr: u64,
         length: u64,
-        msg: Vec<u8>,
+        msg: &Bound<'_, PyAny>,
         timeout_ms: Option<u64>,
     ) -> PyResult<PyTransfer> {
+        let msg = bytes_arg(msg)?;
         let c = self
             .e
             .put_signal(remote_url, src_ptr, dst_ptr, length, msg, ms(timeout_ms))
@@ -590,8 +631,14 @@ impl PyEngine {
 
     /// Sends a message to a peer given by URL (connects on demand) or by
     /// logical-id tuple (an already connected peer).
-    fn send_msg(&self, py: Python<'_>, peer: &Bound<'_, PyAny>, data: Vec<u8>) -> PyResult<()> {
+    fn send_msg(
+        &self,
+        py: Python<'_>,
+        peer: &Bound<'_, PyAny>,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         let t = target(peer)?;
+        let data = bytes_arg(data)?;
         let e = self.e.clone();
         py.allow_threads(move || e.send_msg(t, data)).map_err(to_py)
     }

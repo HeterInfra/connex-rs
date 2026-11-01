@@ -28,3 +28,6 @@ module-name = "connex_rs"
 # UCX is a system library (HPC-X /opt/hpcx/ucx, rpath); bundling it would
 # cut libucs off from its transport modules.
 auditwheel = "skip"
+# Strip the extension (debug info and symbols): the wheel is a third of the
+# size; Rust builds (benches, cargo test) keep debug = 1 for profiling.
+strip = true

@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased
+
+Performance (numbers in the README, "Data-plane microbenchmarks"):
+
+- Connect to first read over rc_mlx5: 0.3-1.7 s down to about 50 ms. The IB
+  transports allocated their 10-40 MB buffer pools with transparent huge
+  pages, a direct-compaction stall on a host with fragmented memory. The
+  engine now sets `IB_ALLOC=mmap,heap` on its UCX config (unless
+  `UCX_*_ALLOC` is set).
+- `put_chain` over RDMA posts the data put, the readback of its last word
+  and the flag put back to back, ordered by UCX worker fences, instead of
+  waiting a round trip after each: 11.7 to 7.7 µs at 4 KB cross-host. The
+  flag still lands only after the data (checked with a consumer that polls
+  the flag and reads the data in GPU memory, 9000 chains, 0 stale).
+  `CONNEX_RS_CHAIN_SERIAL=1` restores the serial steps.
+- Puts post their completion flush right behind the put (one progress pass
+  and, over TCP, about 10% less latency).
+- A completion takes no lock and makes no futex wake when its waiter is
+  still spinning.
+- Idle CPU: an epoll wake by the timer no longer restarts the 500 µs busy
+  poll (an idle engine used 0.5% of a core, now 0.03%), and armed chains
+  back off to 50 µs after 100 ms and 100 µs after 1 s of idle (22% to 7% of
+  a core while a chain waits).
+- TCP: `TCP_TX_SEG_SIZE`/`TCP_RX_SEG_SIZE=256k` (unless set): reads over
+  TCP 0.9 to 3.3 GB/s at 1 MB.
+- Python: the wheel is stripped (2.5 MB to 0.43 MB, installed 9 MB to
+  1 MB); `send_msg`/`put_signal` copy a `bytes` payload with one memcpy
+  instead of item by item (1 MB message: 21 to 3.6 ms); copies of 64 KB or
+  more in `write_bytes_to_buffer`/`read_bytes_from_buffer` release the GIL.
+
+Fixes:
+
+- `Op.is_done()` (Python) and `Completion::is_done` also report done when
+  the progress thread has died; a caller that polls instead of waiting no
+  longer loops forever, and its result is the "progress thread died" error.
+- The listen/connect check against `UCX_NET_DEVICES` accepts an address on
+  an alias (`eth0:1` belongs to `eth0`) and skips deny lists (`^...`).
+- The idle wait never drops below 1 ms (a sub-millisecond heartbeat
+  interval turned it back into a busy poll).
+- A panic on the progress thread left every caller waiting forever. It now
+  fails queued commands, ends waits with an error within 100 ms and marks
+  the engine shut down.
+- `Endpoint.wait_event` and `wait_peer` busy-polled a core for their whole
+  timeout; they now sleep on the worker's event fd between progress calls.
+- `op_timeouts` counted a timed-out op once more for its peer; it now
+  counts each timed-out op once.
+- `post_send_ptr`/`post_recv_ptr`: documented that a cancel deferred after
+  a timed-out wait, or a dropped `Op`, keeps the memory in use.
+- A failed accept is left to UCX on purpose (it already rejects and frees
+  the connection request); documented at the call.
+- An address on an interface that `UCX_NET_DEVICES` does not list (for
+  example 127.0.0.1 with `UCX_NET_DEVICES=mlx5_0:1,ib0`) used to join,
+  fail with "Destination is unreachable" and fail the same way on every
+  reconnect. `listen` (and so `Engine(...)`) now refuses such an address,
+  and `connect` a loopback one, with an error that names the interface. An
+  IPoIB address of a listed RDMA device is accepted (rdmacm reaches it).
+- Fenced `put_chain`: when posting the readback or flag op failed after the
+  data put was posted, the chain completed at once and freed the scratch
+  words the posted ops still pointed into. It now waits for every posted op.
+- RDMA detection treated an exclusion list that removes every IB transport
+  (`UCX_TLS=^ib`, `^rc,dc,ud`) as RDMA, so the fenced chain path and the
+  IB-only config keys were used over TCP.
+
+Tools: `cxrma`, a data-plane microbenchmark (latency, bandwidth, put_chain,
+connect time, idle CPU, chain ordering check), host or GPU memory.
+
 ## 0.1.5
 
 - RMA from or into registered GPU memory below UCX's zero-copy threshold is
