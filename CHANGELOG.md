@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.6
 
 Performance (numbers in the README, "Data-plane microbenchmarks"):
 
