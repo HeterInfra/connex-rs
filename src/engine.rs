@@ -1994,8 +1994,26 @@ impl State {
                         // connect (crossed connects): rkeys were unpacked on
                         // the old endpoint; fetch them again on this one.
                         // Ops already posted keep theirs and complete.
+                        // An rkey request sent on the old endpoint may never
+                        // be answered: ask again for every op still waiting
+                        // (a duplicate reply is harmless).
+                        let mut again = Vec::new();
                         if let Some(rp) = self.remote.get_mut(peer) {
                             rp.regions.clear();
+                            rp.requested.clear();
+                            for w in &rp.waiting {
+                                if rp.requested.insert(w.remote) {
+                                    again.push(w.remote);
+                                }
+                            }
+                        }
+                        for a in again {
+                            self.stats.rkey_fetches += 1;
+                            if let Err(e) = self.ep.am_send(peer, hdr(K_RKEY_REQ, &[a]), Vec::new())
+                            {
+                                self.fail_waiting(peer, e);
+                                break;
+                            }
                         }
                     }
                     // Inbound: the link works. Our own connects report

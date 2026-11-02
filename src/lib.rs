@@ -1505,7 +1505,7 @@ mod tests {
     /// rkey reply broke the peer), also across the 32-bit counter wrap.
     #[test]
     fn event_ring_grows_instead_of_dropping() {
-        let mut ep = Endpoint::new(LogicalId::new("grow", 0, 0, 0)).unwrap();
+        let ep = Endpoint::new(LogicalId::new("grow", 0, 0, 0)).unwrap();
         unsafe { ffi::cx_test_ring_at(ep.ctx, u32::MAX - 100) };
         for _ in 0..20_000 {
             assert_eq!(unsafe { ffi::cx_test_push(ep.ctx, 0x10 as *mut c_void) }, 0);
