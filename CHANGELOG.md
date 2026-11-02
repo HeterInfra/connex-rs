@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.7
+
+Performance:
+
+- Puts to one peer that are posted in the same progress pass share one
+  endpoint flush, instead of one flush per put. An endpoint flush completes
+  only after every earlier operation on that endpoint, so one flush covers
+  them all. Batches of 64 async 4 KiB puts over TCP loopback: 37-53k to
+  80-87k ops/s (`tests/put_rate.rs`, 3 runs each, median of 10 rounds).
+- Batch RMA API: `Engine::rma_batch` and, in Python, `rma_batch` /
+  `transfer_batch_sync` queue many reads or writes to one peer under one
+  command-queue lock and one wakeup. Over TCP loopback this gains nothing
+  over separate `put_async` calls, because the flush was the cost.
+- `put_chain` gate polls back off to at most 50 us (was 200 us). Median
+  time from the gate opening to the flag: 196 to 102 us
+  (`tests/gate_latency.rs`).
+
+Fixes:
+
+- The event ring had 4096 fixed entries. When it was full, events were
+  dropped, and a dropped invalidate or rkey reply broke the peer. The ring
+  now doubles up to 2^18 entries, and it is drained after every UCX
+  progress call instead of once the progress loop is idle. A regression
+  test pushes 20000 events across the 32-bit index wrap.
+- Crossed connect: when an endpoint is replaced, the rkeys of ops that are
+  still waiting are requested again on the new endpoint. A request sent on
+  the old one may never be answered.
+
 ## 0.1.6
 
 Performance (numbers in the README, "Data-plane microbenchmarks"):

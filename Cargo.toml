@@ -1,6 +1,6 @@
 [package]
 name = "connex-rs"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.82"
 description = "Connex data plane over UCX: one-sided RMA on host/GPU memory, identity-keyed peers, peer-failure events, same-identity rejoin"
