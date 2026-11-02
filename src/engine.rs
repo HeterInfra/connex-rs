@@ -31,6 +31,7 @@ use crate::{
     deadline_in, debug_enabled, Endpoint, Error, Event, Heartbeat, LogicalId, MemRegion, Req,
     Result, Rkey,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -352,6 +353,24 @@ impl Shared {
         self.msgs_cv.notify_all();
     }
 
+    /// Queues several commands under one lock (and one wakeup).
+    fn push_all(&self, cs: Vec<Cmd>) {
+        {
+            let mut q = self.cmds.lock().unwrap();
+            if self.closed.load(Ordering::SeqCst) {
+                drop(q);
+                for c in cs {
+                    fail_cmd(c, Error::Invalid("engine is shut down".into()));
+                }
+                return;
+            }
+            q.extend(cs);
+        }
+        if self.sleeping.load(Ordering::SeqCst) {
+            self.kick();
+        }
+    }
+
     fn push(&self, c: Cmd) {
         {
             let mut q = self.cmds.lock().unwrap();
@@ -582,6 +601,47 @@ impl Engine {
         Ok(done)
     }
 
+    /// Starts several one-sided reads (`is_put` false) or writes to one peer
+    /// at once: `ops` are (local, remote, len). One command-queue lock for
+    /// all of them, and the puts posted together share one endpoint flush.
+    pub fn rma_batch(
+        &self,
+        url: &str,
+        is_put: bool,
+        ops: &[(u64, u64, u64)],
+        timeout: Option<Duration>,
+    ) -> Result<Vec<Arc<Completion>>> {
+        let url = PeerUrl::parse(url)?;
+        for &(local, remote, len) in ops {
+            if !range_ok(local, len) || !range_ok(remote, len) {
+                return Err(Error::Invalid(format!(
+                    "RMA range wraps: local {local:#x}, remote {remote:#x}, len {len}"
+                )));
+            }
+        }
+        let deadline = op_deadline(timeout.unwrap_or(DEFAULT_OP_TIMEOUT));
+        let cuda_ctx = crate::cuda_ctx_current();
+        let mut out = Vec::with_capacity(ops.len());
+        let mut cmds = Vec::with_capacity(ops.len());
+        for &(local, remote, len) in ops {
+            let done = Completion::for_caller(&self.shared.dead);
+            out.push(done.clone());
+            cmds.push(Cmd::Rma {
+                cuda_ctx,
+                url: url.clone(),
+                is_put,
+                local,
+                remote,
+                len,
+                deadline,
+                signal: None,
+                done,
+            });
+        }
+        self.shared.push_all(cmds);
+        Ok(out)
+    }
+
     /// Blocking one-sided read of `len` bytes at `src` in the peer at `url`
     /// into local `dst`.
     pub fn get(
@@ -796,7 +856,26 @@ struct Inflight {
     /// Put + signal: after the flush, send this message.
     signal: Option<Vec<u8>>,
     flushing: bool,
+    /// A put posted this pass: gets the peer's one flush of the pass.
+    await_flush: bool,
+    /// That flush, shared by the puts it covers (`req` is then done).
+    shared: Option<Rc<RefCell<SharedFlush>>>,
     done: Arc<Completion>,
+}
+
+/// One endpoint flush covering every put posted to the peer before it.
+struct SharedFlush {
+    req: Req,
+    res: Option<Result<()>>,
+}
+
+impl SharedFlush {
+    fn poll(&mut self) -> Option<Result<()>> {
+        if self.res.is_none() {
+            self.res = self.req.test();
+        }
+        self.res.clone()
+    }
 }
 
 /// A put chain: the progress thread waits until the u32 at the local
@@ -925,6 +1004,9 @@ struct State {
     /// Requests whose callers were already answered (peer closed); UCX
     /// completes them with an error later and they are freed then.
     orphans: Vec<Req>,
+    /// Peers with puts posted since the last flush_batch.
+    need_flush: Vec<LogicalId>,
+    flushes: Vec<Rc<RefCell<SharedFlush>>>,
     /// Our connects waiting for their first flush (-> PeerUp).
     pending_up: Vec<(LogicalId, Req)>,
     /// PeerJoined events still to come from our own connects (Endpoint
@@ -995,6 +1077,8 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         chains: HashMap::new(),
         unreg: Vec::new(),
         orphans: Vec::new(),
+        need_flush: Vec::new(),
+        flushes: Vec::new(),
         pending_up: Vec::new(),
         own_joins: HashMap::new(),
         up: HashSet::new(),
@@ -1016,6 +1100,7 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         work |= st.drain_events();
         work |= st.check_inflight();
         work |= st.check_chains();
+        st.flush_batch(); // puts the chains just posted
         st.check_unreg();
         if work {
             last_work = Instant::now();
@@ -1395,18 +1480,14 @@ impl State {
             )
         };
         match r {
-            Ok(mut req) => {
-                // A put completes once remotely complete: post the flush
+            Ok(req) => {
+                // A put completes once remotely complete: it gets a flush
                 // right behind it instead of after its local completion
                 // (one progress pass and, over TCP, one round trip less).
-                // The flush completes only after the put, so the put's own
-                // request is just reaped.
-                let mut flushing = false;
-                if w.is_put {
-                    if let Ok(f) = self.ep.flush(peer) {
-                        self.orphans.push(std::mem::replace(&mut req, f));
-                        flushing = true;
-                    }
+                // The puts posted to a peer in one pass share one flush
+                // (flush_batch): it completes only after all of them.
+                if w.is_put && !self.need_flush.contains(peer) {
+                    self.need_flush.push(peer.clone());
                 }
                 self.inflight.push(Inflight {
                     peer: peer.clone(),
@@ -1418,7 +1499,9 @@ impl State {
                     deadline: w.deadline,
                     is_put: w.is_put,
                     signal: w.signal,
-                    flushing,
+                    flushing: false,
+                    await_flush: w.is_put,
+                    shared: None,
                     done: w.done,
                 })
             }
@@ -1439,7 +1522,47 @@ impl State {
         }
     }
 
+    /// One flush per peer for the puts posted since the last call.
+    fn flush_batch(&mut self) {
+        if self.need_flush.is_empty() {
+            return;
+        }
+        for p in std::mem::take(&mut self.need_flush) {
+            let f = self.ep.flush(&p).ok().map(|req| {
+                let f = Rc::new(RefCell::new(SharedFlush { req, res: None }));
+                self.flushes.push(f.clone());
+                f
+            });
+            for o in self.inflight.iter_mut() {
+                if o.await_flush && o.peer == p {
+                    o.await_flush = false;
+                    if let Some(f) = &f {
+                        // the flush completes only after the put: its own
+                        // request is just reaped
+                        self.orphans
+                            .push(std::mem::replace(&mut o.req, Req::done()));
+                        o.shared = Some(f.clone());
+                        o.flushing = true;
+                    } // else: flushed on its own once locally complete
+                }
+            }
+        }
+    }
+
     fn check_inflight(&mut self) -> bool {
+        self.flush_batch();
+        let orphans = &mut self.orphans;
+        self.flushes.retain(|f| {
+            if Rc::strong_count(f) > 1 {
+                return true;
+            }
+            // no op waits for it any more (failed or timed out): reap it
+            let mut f = f.borrow_mut();
+            if f.res.is_none() {
+                orphans.push(std::mem::replace(&mut f.req, Req::done()));
+            }
+            false
+        });
         self.orphans.retain_mut(|r| r.test().is_none());
         if !self.pending_up.is_empty() {
             let mut up = Vec::new();
@@ -1466,7 +1589,11 @@ impl State {
         let mut i = 0;
         while i < self.inflight.len() {
             let o = &mut self.inflight[i];
-            match o.req.test() {
+            let st = match &o.shared {
+                Some(f) => f.borrow_mut().poll(),
+                None => o.req.test(),
+            };
+            match st {
                 None => {
                     if now >= o.deadline {
                         // counted per op (an expired rkey wait below too);
@@ -1855,6 +1982,8 @@ impl State {
                 is_put,
                 signal: None,
                 flushing: true,
+                await_flush: false,
+                shared: None,
                 done: done.clone(),
             });
             if i == n - 1 {

@@ -532,6 +532,54 @@ impl PyEngine {
         Ok(PyTransfer { c })
     }
 
+    /// Starts several one-sided reads (`is_put` False: `ops` are
+    /// (local dst, remote src, length)) or writes ((local src, remote dst,
+    /// length)) to one peer in one call; returns a list of Transfer handles.
+    #[pyo3(signature = (remote_url, is_put, ops, timeout_ms=None))]
+    fn rma_batch(
+        &self,
+        remote_url: &str,
+        is_put: bool,
+        ops: Vec<(u64, u64, u64)>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Vec<PyTransfer>> {
+        let cs = self
+            .e
+            .rma_batch(remote_url, is_put, &ops, ms(timeout_ms))
+            .map_err(to_py)?;
+        Ok(cs.into_iter().map(|c| PyTransfer { c }).collect())
+    }
+
+    /// `rma_batch` and wait for all of it (GIL released). Returns 0, or the
+    /// code of the first failure (< 0, as `transfer_sync_read`).
+    #[pyo3(signature = (remote_url, is_put, ops, timeout_ms=None))]
+    fn transfer_batch_sync(
+        &self,
+        py: Python<'_>,
+        remote_url: &str,
+        is_put: bool,
+        ops: Vec<(u64, u64, u64)>,
+        timeout_ms: Option<u64>,
+    ) -> i64 {
+        let e = self.e.clone();
+        let url = remote_url.to_string();
+        py.allow_threads(move || {
+            let cs = match e.rma_batch(&url, is_put, &ops, ms(timeout_ms)) {
+                Ok(cs) => cs,
+                Err(err) => return code(&err),
+            };
+            let mut rc = 0;
+            for c in cs {
+                if let Some(Err(err)) = c.wait(None) {
+                    if rc == 0 {
+                        rc = code(&err);
+                    }
+                }
+            }
+            rc
+        })
+    }
+
     /// Starts a one-sided write of local `src_ptr` to `dst_ptr` in the peer;
     /// returns a Transfer handle (completes once the data is in place).
     #[pyo3(signature = (remote_url, src_ptr, dst_ptr, length, timeout_ms=None))]

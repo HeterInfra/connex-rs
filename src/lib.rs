@@ -472,6 +472,11 @@ impl Drop for Rkey {
 pub struct Req(*mut c_void);
 
 impl Req {
+    /// A request that is already complete.
+    pub fn done() -> Req {
+        Req(std::ptr::null_mut())
+    }
+
     /// Non-blocking test (does not progress): None while pending.
     pub fn test(&mut self) -> Option<Result<()>> {
         if self.0.is_null() {
