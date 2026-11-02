@@ -26,7 +26,8 @@
 #define CX_AM_HELLO 1
 #define CX_AM_HB 2
 #define CX_AM_USER 3
-#define CX_EVQ 4096
+#define CX_EVQ 4096            // initial event ring capacity (power of two)
+#define CX_EVQ_MAX (1u << 18)  // it doubles up to this; beyond, events are dropped
 #define CX_HELLO_MAX 256
 
 enum { CX_EV_ERROR = 1, CX_EV_CONN_REQUEST = 2, CX_EV_HELLO = 3, CX_EV_HB = 4, CX_EV_AM = 5 };
@@ -47,6 +48,7 @@ typedef struct {
     ucp_worker_h worker;
     ucp_listener_h listener;
     cx_event_t *ring;
+    uint32_t cap;         // ring capacity, a power of two (divides 2^32: indices wrap cleanly)
     uint32_t head, tail;  // ring indices (tail = next write)
     uint64_t dropped;
     int rdma;             // RDMA usable at creation (cx_rdma_usable)
@@ -60,12 +62,26 @@ static uint64_t now_ns(void) {
 
 uint64_t cx_now_ns(void) { return now_ns(); }
 
+// A full ring grows (a dropped invalidate or rkey reply breaks the peer):
+// the queued entries move to the same indices modulo the new capacity.
+static int grow_ring(cx_ctx_t *c) {
+    if (c->cap >= CX_EVQ_MAX) return -1;
+    uint32_t ncap = c->cap * 2;
+    cx_event_t *n = calloc(ncap, sizeof(cx_event_t));
+    if (!n) return -1;
+    for (uint32_t i = c->head; i != c->tail; i++) n[i & (ncap - 1)] = c->ring[i & (c->cap - 1)];
+    free(c->ring);
+    c->ring = n;
+    c->cap = ncap;
+    return 0;
+}
+
 static cx_event_t *push_event(cx_ctx_t *c) {
-    if (c->tail - c->head >= CX_EVQ) {
+    if (c->tail - c->head >= c->cap && grow_ring(c) != 0) {
         c->dropped++;
         return NULL;
     }
-    cx_event_t *e = &c->ring[c->tail % CX_EVQ];
+    cx_event_t *e = &c->ring[c->tail & (c->cap - 1)];
     memset(e, 0, offsetof(cx_event_t, data));
     e->payload = NULL;
     e->plen = 0;
@@ -297,6 +313,7 @@ int cx_create(cx_ctx_t **out) {
     cx_ctx_t *c = calloc(1, sizeof(*c));
     if (!c) return UCS_ERR_NO_MEMORY;
     c->ring = calloc(CX_EVQ, sizeof(cx_event_t));
+    c->cap = CX_EVQ;
     ucp_config_t *cfg;
     ucs_status_t st = UCS_ERR_NO_MEMORY;
     if (!c->ring) goto fail;
@@ -381,7 +398,7 @@ fail:
 void cx_destroy(cx_ctx_t *c) {
     if (!c) return;
     if (c->listener) ucp_listener_destroy(c->listener);
-    for (; c->head != c->tail; c->head++) free(c->ring[c->head % CX_EVQ].payload);
+    for (; c->head != c->tail; c->head++) free(c->ring[c->head & (c->cap - 1)].payload);
     ucp_worker_destroy(c->worker);
     ucp_cleanup(c->context);
     free(c->ring);
@@ -407,7 +424,7 @@ int cx_arm(cx_ctx_t *c) {
 
 int cx_poll_event(cx_ctx_t *c, cx_event_t *out) {
     if (c->head == c->tail) return 0;
-    *out = c->ring[c->head % CX_EVQ];
+    *out = c->ring[c->head & (c->cap - 1)];
     c->head++;
     return 1;
 }
@@ -420,7 +437,7 @@ void cx_forget_ep(cx_ctx_t *c, void *ep) {
     // uint32_t like head/tail: a wider index would never meet tail once
     // the 32-bit counters wrap (an endless loop after 2^32 events).
     for (uint32_t i = c->head; i != c->tail; i++) {
-        cx_event_t *e = &c->ring[i % CX_EVQ];
+        cx_event_t *e = &c->ring[i & (c->cap - 1)];
         if (e->ep == ep) {
             free(e->payload);
             e->payload = NULL;

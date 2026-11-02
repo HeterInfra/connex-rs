@@ -775,16 +775,18 @@ impl Endpoint {
     /// of UCX progress steps that did work.
     pub fn progress(&mut self) -> u32 {
         let mut n = 0;
+        let mut ev = ffi::CxEvent::default();
         loop {
             let k = unsafe { ffi::cx_progress(self.ctx) };
             n += k;
+            // Drain as we go: a long burst of completions must not pile up
+            // in the shim's event ring (it grows, but is bounded).
+            while unsafe { ffi::cx_poll_event(self.ctx, &mut ev) } == 1 {
+                self.handle(&ev);
+            }
             if k == 0 {
                 break;
             }
-        }
-        let mut ev = ffi::CxEvent::default();
-        while unsafe { ffi::cx_poll_event(self.ctx, &mut ev) } == 1 {
-            self.handle(&ev);
         }
         if self.heartbeat.is_some() {
             self.heartbeat_tick();
@@ -1497,6 +1499,25 @@ mod tests {
         // The forgotten events are drained as no-ops.
         ep.progress();
         assert!(ep.next_event().is_none());
+    }
+
+    /// A full event ring grew instead of dropping (a dropped invalidate or
+    /// rkey reply broke the peer), also across the 32-bit counter wrap.
+    #[test]
+    fn event_ring_grows_instead_of_dropping() {
+        let mut ep = Endpoint::new(LogicalId::new("grow", 0, 0, 0)).unwrap();
+        unsafe { ffi::cx_test_ring_at(ep.ctx, u32::MAX - 100) };
+        for _ in 0..20_000 {
+            assert_eq!(unsafe { ffi::cx_test_push(ep.ctx, 0x10 as *mut c_void) }, 0);
+        }
+        assert_eq!(unsafe { ffi::cx_dropped_events(ep.ctx) }, 0);
+        let mut ev = ffi::CxEvent::default();
+        let mut n = 0;
+        while unsafe { ffi::cx_poll_event(ep.ctx, &mut ev) } == 1 {
+            assert_eq!(ev.ep as usize, 0x10);
+            n += 1;
+        }
+        assert_eq!(n, 20_000);
     }
 
     #[test]
