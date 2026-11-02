@@ -868,7 +868,7 @@ pub fn reached(word: u32, val: u32) -> bool {
 /// Gate polls back off from this ...
 const GATE_POLL_MIN: Duration = Duration::from_micros(2);
 /// ... up to this between two one-sided reads of a gate that is not open.
-const GATE_POLL_MAX: Duration = Duration::from_micros(200);
+const GATE_POLL_MAX: Duration = Duration::from_micros(50);
 
 const CANCEL: u32 = 0x7FFF_FFFF;
 /// One RMA of the fenced chain sequence: (is_put, local, remote, len,
