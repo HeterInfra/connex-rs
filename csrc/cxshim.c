@@ -336,7 +336,7 @@ int cx_create(cx_ctx_t **out) {
     // Wire-up time: the IB transports allocate their 10-40 MB receive and
     // send buffer pools with transparent huge pages first. On a host with
     // fragmented memory and THP defrag=madvise that is a direct compaction
-    // stall, which made an rc_mlx5 connect take 30 ms to 1.7 s (cc241).
+    // stall, which made an rc_mlx5 connect take 30 ms to 1.7 s.
     // Plain pages make it a steady ~40 ms; the pools are not on the RDMA
     // data path. ("IB_ALLOC" reaches the IB sub-table of rc/ud/dc.)
     static const char *const ib_tls[] = {"IB", "RC", "RC_MLX5", "RC_VERBS", "DC_MLX5", "UD", "UD_MLX5", "UD_VERBS"};
