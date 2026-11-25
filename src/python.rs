@@ -568,8 +568,13 @@ impl PyEngine {
                 Ok(cs) => cs,
                 Err(err) => return code(&err),
             };
+            // Wait on the last op first: ops to one peer complete roughly in
+            // order, so by then the others are done and their waits return
+            // at once. Waiting in posting order spun and parked once per op
+            // (each wait spins briefly before it sleeps), which cost about
+            // as much caller CPU as posting the ops one by one.
             let mut rc = 0;
-            for c in cs {
+            for c in cs.iter().rev() {
                 if let Some(Err(err)) = c.wait(None) {
                     if rc == 0 {
                         rc = code(&err);

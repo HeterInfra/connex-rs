@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.8
+
+Performance:
+
+- `transfer_batch_sync` waits on the last op of the batch first. Ops to one
+  peer complete roughly in order, so the other waits then return at once;
+  waiting in posting order spun briefly and parked once per op. Connex's
+  fragmented KV pull (`benchmarks/pd/rs_batch_read.py` in Connex, mlx5 RDMA
+  loopback, host memory, 32768 x 4 KiB reads): caller CPU 50 ms per-op ->
+  14 ms batched, wall 50 -> 43 ms.
+
 ## 0.1.7
 
 Performance:
