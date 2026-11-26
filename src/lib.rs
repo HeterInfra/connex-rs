@@ -490,6 +490,15 @@ impl Req {
         self.0 = std::ptr::null_mut();
         Some(if st == 0 { Ok(()) } else { Err(ucx_err(st)) })
     }
+
+    /// Hands the request back to UCX without waiting for it: freed now if
+    /// complete, else by UCX when it completes. Call it while the endpoint
+    /// that posted it still exists.
+    pub fn release(self) {
+        if !self.0.is_null() {
+            unsafe { ffi::cx_req_free(self.0) };
+        }
+    }
 }
 
 fn req_from(r: *mut c_void) -> Result<Req> {

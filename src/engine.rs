@@ -449,8 +449,9 @@ impl Engine {
                 if r.is_err() {
                     // A bug, not a peer failure: fail everything instead of
                     // leaving callers waiting forever on a dead thread.
-                    // (Endpoints and memory of the dropped state are
-                    // released by their destructors during the unwind.)
+                    // (The unwind drops the state, whose Drop runs the same
+                    // teardown as a shutdown: endpoints closed, requests
+                    // freed, regions unmapped before the context goes.)
                     eprintln!("connex-rs: progress thread panicked; engine is shut down");
                     sh2.dead.store(true, Ordering::SeqCst);
                     sh2.stop.store(true, Ordering::SeqCst);
@@ -1020,6 +1021,18 @@ struct State {
     gpu_rma_min: u64,
     /// RDMA context: put chains use the fenced sequence.
     rdma: bool,
+    /// [`State::teardown`] ran.
+    torn_down: bool,
+}
+
+/// A panic in the progress thread unwinds through here: the teardown still
+/// runs, so every registered region is unmapped, every request freed and
+/// every rkey destroyed while the UCP context lives (the fields drop after
+/// this, `ep` first, which destroys the worker and the context).
+impl Drop for State {
+    fn drop(&mut self) {
+        self.teardown();
+    }
 }
 
 fn rd64(b: &[u8], off: usize) -> u64 {
@@ -1086,6 +1099,7 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
         stats: EngineStats::default(),
         gpu_rma_min: crate::gpu_rma_min(),
         rdma: false,
+        torn_down: false,
     };
     st.rdma = st.ep.is_rdma() && std::env::var_os("CONNEX_RS_CHAIN_SERIAL").is_none();
     let spin = cfg.spin;
@@ -1172,33 +1186,7 @@ fn run(cfg: EngineConfig, sh: Arc<Shared>, ready: mpsc::Sender<Result<u16>>, cud
             last_work = Instant::now();
         }
     }
-    // Shutdown. Close every endpoint first: answering callers frees their
-    // buffers (and the chains' scratch words), and RDMA already posted on a
-    // live QP could still land there. A force-closed endpoint does no
-    // further DMA. Then fail everything outstanding, unmap, drop.
-    for p in st.ep.peers() {
-        st.ep.drop_peer(&p);
-    }
-    for o in st.inflight.drain(..) {
-        o.done.set(Err(Error::Canceled));
-    }
-    for (_, q) in st.chains.drain() {
-        for c in q {
-            c.done.set(Err(Error::Canceled));
-        }
-    }
-    for (_, p) in st.remote.drain() {
-        for w in p.waiting {
-            w.done.set(Err(Error::Canceled));
-        }
-    }
-    for u in st.unreg.drain(..) {
-        u.done.set(Err(Error::Canceled));
-    }
-    let regions: Vec<_> = std::mem::take(&mut st.local).into_values().collect();
-    for r in regions {
-        let _ = st.ep.mem_unmap(r.region);
-    }
+    st.teardown();
     let left = {
         let mut q = sh.cmds.lock().unwrap();
         sh.closed.store(true, Ordering::SeqCst);
@@ -1226,6 +1214,54 @@ fn fail_cmd(c: Cmd, e: Error) {
 }
 
 impl State {
+    /// Shutdown (idempotent). Close every endpoint first: answering callers
+    /// frees their buffers (and the chains' scratch words), and RDMA already
+    /// posted on a live QP could still land there. A force-closed endpoint
+    /// does no further DMA. Then fail everything outstanding, hand the
+    /// requests back to UCX (freed once the closes purge them), unmap.
+    /// Leaving a region mapped until `ucp_cleanup` is a use-after-teardown
+    /// (UCX built with assertions aborts on the still-referenced rcache
+    /// region).
+    fn teardown(&mut self) {
+        if self.torn_down {
+            return;
+        }
+        self.torn_down = true;
+        for p in self.ep.peers() {
+            self.ep.drop_peer(&p);
+        }
+        for o in self.inflight.drain(..) {
+            o.done.set(Err(Error::Canceled));
+            o.req.release();
+        }
+        for (_, q) in self.chains.drain() {
+            for c in q {
+                c.done.set(Err(Error::Canceled));
+            }
+        }
+        for (_, p) in self.remote.drain() {
+            for w in p.waiting {
+                w.done.set(Err(Error::Canceled));
+            }
+        }
+        for u in self.unreg.drain(..) {
+            u.done.set(Err(Error::Canceled));
+        }
+        for f in self.flushes.drain(..) {
+            std::mem::replace(&mut f.borrow_mut().req, Req::done()).release();
+        }
+        for r in self.orphans.drain(..) {
+            r.release();
+        }
+        for (_, r) in self.pending_up.drain(..) {
+            r.release();
+        }
+        let regions: Vec<_> = std::mem::take(&mut self.local).into_values().collect();
+        for r in regions {
+            let _ = self.ep.mem_unmap(r.region);
+        }
+    }
+
     fn drain_cmds(&mut self) -> bool {
         let cmds: Vec<Cmd> = {
             let mut q = self.sh.cmds.lock().unwrap();

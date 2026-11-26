@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+Fixes:
+
+- A panic in the progress thread now runs the same teardown as a shutdown
+  before the UCP context is destroyed: endpoints force-closed, outstanding
+  requests freed, registered regions unmapped, rkeys destroyed. Before, the
+  unwind dropped the state field by field, the endpoint (and with it the
+  context) first, so regions were never unmapped and rkeys were destroyed
+  after `ucp_cleanup`. UCX builds with assertions (Ubuntu's libucx 1.20)
+  abort in `ucp_cleanup` (`rcache.c: Assertion 'region->refcount == 0'`),
+  which failed `progress_thread_panic_answers_callers` in CI. Shutdown also
+  frees the requests it used to leak (UCX warned "not returned to mpool").
+- The 256 KB TCP segment size is applied on UCX >= 1.17 too, which matches
+  transport options only by their prefixed name (`TCP_TX_SEG_SIZE`); the
+  bare name used before was ignored there ("invalid configurations") and
+  TCP gets ran with 8 KB fragments (loopback, 64 MiB gets, UCX 1.20:
+  1.8 -> 5.6 GB/s). UCX 1.16 keeps the bare name it requires.
+
 ## 0.1.8
 
 Performance:

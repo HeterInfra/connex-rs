@@ -346,9 +346,16 @@ int cx_create(cx_ctx_t **out) {
         ucp_config_modify(cfg, "IB_ALLOC", "mmap,heap");
     // Over TCP, get is emulated with request/response fragments of
     // TCP_TX_SEG_SIZE (8 KB default): 0.9 GB/s; 256 KB: 3.3 GB/s.
+    // ucp_config_modify passes unknown keys on to every transport's table:
+    // up to UCX 1.16 they match the bare field name ("TX_SEG_SIZE"), from
+    // 1.17 on the name with the table prefix ("TCP_TX_SEG_SIZE"); the other
+    // spelling is ignored ("invalid configurations"), leaving 8 KB.
     if (cx_tcp_usable() && !getenv("UCX_TCP_TX_SEG_SIZE") && !getenv("UCX_TCP_RX_SEG_SIZE")) {
-        ucp_config_modify(cfg, "TX_SEG_SIZE", "256k");
-        ucp_config_modify(cfg, "RX_SEG_SIZE", "256k");
+        unsigned maj, min, rel;
+        ucp_get_version(&maj, &min, &rel);
+        int prefixed = maj > 1 || (maj == 1 && min >= 17);
+        ucp_config_modify(cfg, prefixed ? "TCP_TX_SEG_SIZE" : "TX_SEG_SIZE", "256k");
+        ucp_config_modify(cfg, prefixed ? "TCP_RX_SEG_SIZE" : "RX_SEG_SIZE", "256k");
     }
     ucp_params_t p;
     memset(&p, 0, sizeof(p));
